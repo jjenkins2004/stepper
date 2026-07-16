@@ -87,7 +87,7 @@ class Stage:
                     step_name=step.name,
                     input_type=input_type,
                     output_type=output_type,
-                ):
+                ) as report:
                     # Grab the step's input based on its declared dependencies
                     inputs = {name: self._persist.fetch(get_step_key_for(dep), dep.model) for name, dep in deps.items()}
 
@@ -97,6 +97,9 @@ class Stage:
                     # Persist the result if the step declares an output model
                     if step.model is not None:
                         self._persist.persist(get_step_key_for(step), result, step.model)
+                        # Hand the output to the hook's StepReport (if it yielded one).
+                        if report is not None:
+                            report.set_output(result)
             except Exception as exc:
                 elapsed_ms = int((perf_counter() - started) * 1000)
                 _LOGGER.exception(format_step_fail(step_name=step.name, elapsed_ms=elapsed_ms, error_type=type(exc).__name__))

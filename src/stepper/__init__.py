@@ -5,7 +5,7 @@ and run a `Pipeline`. Values persist per step via a `PersistService`; run order 
 derived from the dependency DAG, not declaration order.
 """
 
-from stepper.hooks import Hooks, NoOpHooks
+from stepper.hooks import Hooks, NoOpHooks, StepReport
 from stepper.logging_config import configure_logging
 from stepper.persist import DiskPersistService, PersistService
 from stepper.pipeline import Pipeline, StageFactory
@@ -25,5 +25,6 @@ __all__ = [
     "DiskPersistService",
     "Hooks",
     "NoOpHooks",
+    "StepReport",
     "configure_logging",
 ]

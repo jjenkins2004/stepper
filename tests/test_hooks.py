@@ -10,7 +10,7 @@ from contextlib import contextmanager, nullcontext
 
 import pytest
 
-from stepper import Pipeline
+from stepper import Pipeline, StepReport
 from stepper.stage import Stage
 from stepper.step import depends, step
 
@@ -117,6 +117,49 @@ def test_after_yield_runs_after_output_is_persisted(persist, tmp_path, run):
     run(AStage(persist_service=persist, hooks=_PersistProbeHooks(tmp_path, saw)).run_step("prod"))
     assert saw["before"] is False  # nothing persisted yet when the step body starts
     assert saw["after"] is True    # output on disk by the time after-yield runs
+
+
+class _OutputHooks:
+    """Yields a `StepReport` and, after the yield, stashes what the framework filled."""
+
+    def __init__(self, captured: dict):
+        self._captured = captured
+
+    @contextmanager
+    def step(self, *, stage_name, step_name, input_type, output_type):
+        report = StepReport()
+        yield report
+        self._captured["has_output"] = report.has_output
+        self._captured["output"] = report.output
+
+    @contextmanager
+    def stage(self, *, stage_name, step_count):
+        yield
+
+
+def test_step_report_receives_the_step_output(persist, run):
+    """The framework fills the yielded StepReport with the step's return value, readable
+    in the after-yield code."""
+    captured: dict = {}
+    run(AStage(persist_service=persist, hooks=_OutputHooks(captured)).run_step("prod"))
+    assert captured["has_output"] is True
+    assert captured["output"] == Item(value=1)  # AStage.prod returns Item(value=1)
+
+
+def test_step_report_has_no_output_for_modelless_step(persist, run):
+    """A step with no return annotation persists nothing, so its StepReport stays empty."""
+    captured: dict = {}
+
+    @step
+    async def noop(self):  # no return annotation -> model is None
+        return "ignored"
+
+    class NoopStage(Stage):
+        steps = (noop,)
+
+    run(NoopStage(persist_service=persist, hooks=_OutputHooks(captured)).run_step("noop"))
+    assert captured["has_output"] is False
+    assert captured["output"] is None
 
 
 def test_step_hook_sees_error_and_skips_after(persist, run):

@@ -91,15 +91,18 @@ from contextlib import contextmanager
 
 import logfire
 
-from stepper import Pipeline
+from stepper import Pipeline, StepReport
 
 
 class LogfireHooks:
     @contextmanager
     def step(self, *, stage_name, step_name, input_type, output_type):
+        report = StepReport()
         with logfire.span("step {step_name}", step_name=step_name, stage=stage_name,
-                          input_type=input_type, output_type=output_type):
-            yield
+                          input_type=input_type, output_type=output_type) as span:
+            yield report                          # framework fills report after the step runs
+            if report.has_output:
+                span.set_attribute("output", report.output)
 
     @contextmanager
     def stage(self, *, stage_name, step_count):
@@ -109,6 +112,14 @@ class LogfireHooks:
 
 pipeline = Pipeline(..., hooks=LogfireHooks())
 ```
+
+**Capturing a step's output.** The output only exists *after* the step runs (after your
+`yield`), so you can't yield it. Instead yield a `StepReport`: the framework calls
+`report.set_output(result)` once the step has run and persisted, and your after-`yield`
+code reads `report.output` (guard with `report.has_output` — a step with no return
+annotation persists nothing and leaves the report empty). You never fill it; you never
+implement a method — the framework only ever touches its own `StepReport` type, so
+there's no tracing coupling. Yield nothing if you don't need the output.
 
 Exactly when each runs:
 
@@ -136,7 +147,8 @@ you want into your hooks instance (e.g. `LogfireHooks(run_id=...)`).
 ## Public API
 
 `Pipeline`, `StageFactory`, `Stage`, `Step`, `step`, `depends`, `Scheduler`,
-`PersistService`, `DiskPersistService`, `Hooks`, `NoOpHooks`, `configure_logging`.
+`PersistService`, `DiskPersistService`, `Hooks`, `NoOpHooks`, `StepReport`,
+`configure_logging`.
 
 ## License
 

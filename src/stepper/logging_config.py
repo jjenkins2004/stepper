@@ -11,8 +11,9 @@ import logging
 
 
 def configure_logging(*, level: int = logging.INFO, fmt: str = "%(message)s") -> None:
-    """Set up stdlib logging so step/module lines print. `basicConfig` if the root
-    logger has no handlers yet, otherwise just set its level."""
+    """Set up stdlib logging so step/module lines print. `level` sets verbosity; `fmt`
+    is the log-line format (default: just the message). `basicConfig` if the root logger
+    has no handlers yet, otherwise just set its level."""
     root_logger = logging.getLogger()
     if not root_logger.handlers:
         logging.basicConfig(level=level, format=fmt)

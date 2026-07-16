@@ -49,9 +49,23 @@ class Hooks(Protocol):
 
     def step(
         self, *, stage_name: str, step_name: str, input_type: str, output_type: str
-    ) -> AbstractContextManager[StepReport | None]: ...
+    ) -> AbstractContextManager[StepReport | None]:
+        """Wrap one step.
 
-    def stage(self, *, stage_name: str, step_count: int) -> AbstractContextManager[Any]: ...
+        Args:
+            stage_name: Stage the step belongs to (e.g. "Extract").
+            step_name: The step's name.
+            input_type: Comma-joined names of the models the step reads via `depends()`,
+                or "None" if it takes no inputs.
+            output_type: Name of the model the step returns, or "None" if it persists nothing.
+
+        Yield a `StepReport` to receive the step's output after it runs, or yield nothing.
+        """
+        ...
+
+    def stage(self, *, stage_name: str, step_count: int) -> AbstractContextManager[Any]:
+        """Wrap one stage run. `step_count` is how many steps the stage contains."""
+        ...
 
 
 class NoOpHooks:

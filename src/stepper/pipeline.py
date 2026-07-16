@@ -1,7 +1,8 @@
 """Pipeline — one named, run-scoped set of stages.
 
 Owns everything internal to running a single pipeline: its name, the PersistService
-(namespaced by `output_root/name/run_id` so runs never collide), building and running
+(namespaced by `output_root/name`, plus `/run_id` when given so runs never collide),
+building and running
 its stages, and listing its steps. This is the stuff that doesn't change run to run —
 the pipeline's shape.
 
@@ -14,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from stepper.hooks import Hooks, NoOpHooks
+from stepper.hooks import Hooks
 from stepper.persist import DiskPersistService, PersistService
 from stepper.stage import Stage
 
@@ -31,19 +32,38 @@ class Pipeline:
         self,
         *,
         name: str,
-        run_id: str,
         stages: dict[str, StageFactory],
+        run_id: str | None = None,
         output_root: Path | str = Path("output"),
         persist_service: PersistService | None = None,
         hooks: Hooks | None = None,
     ) -> None:
+        """
+        Args:
+            name: Pipeline name; the first path segment of the default output dir
+                (e.g. "orders" -> output/orders/...).
+            stages: Maps stage name -> a factory that builds the stage from the shared
+                PersistService. Dict order is run order when you run `module="all"`.
+            run_id: Optional per-run label. Adds a `/run_id` subdir so repeat runs don't
+                overwrite each other. Only the default disk backend uses it — a custom
+                `persist_service` sets its own run_id.
+            output_root: Root dir for the default disk backend. Final path is
+                `output_root/name[/run_id]`. Relative paths resolve against cwd.
+            persist_service: Bring-your-own backend (in-memory, object store, DB). When
+                given it wins — `output_root`/`run_id` are ignored and no disk backend
+                is built.
+            hooks: Wraps every stage and step this pipeline runs (tracing/metrics/etc.).
+                Omit and each stage keeps whatever hooks it was built with.
+        """
         self.name = name
         self.run_id = run_id
         self._stage_factories = stages
-        self._hooks: Hooks = hooks or NoOpHooks()
-        # Explicit persist_service wins; otherwise a disk backend under output_root/name/run_id.
+        # None means "pipeline sets no hooks" — each stage keeps its own (see build_stage).
+        self._hooks: Hooks | None = hooks
+        # Explicit persist_service wins; otherwise a disk backend rooted at
+        # output_root/name, handed run_id so it lands per-run output under it.
         self.persist_service: PersistService = persist_service or DiskPersistService(
-            base_dir=Path(output_root) / name / run_id
+            base_dir=Path(output_root) / name, run_id=run_id
         )
 
     def stage_names(self) -> list[str]:
@@ -58,7 +78,9 @@ class Pipeline:
                 f"Available: {self.stage_names()}"
             ) from None
         stage = factory(self.persist_service)
-        stage._hooks = self._hooks  # pipeline-level hooks wrap every stage/step it runs
+        # Only override when the pipeline was given hooks; otherwise the stage keeps its own.
+        if self._hooks is not None:
+            stage._hooks = self._hooks  # pipeline-level hooks wrap every stage/step it runs
         return stage
 
     def step_map(self) -> dict[str, list[str]]:

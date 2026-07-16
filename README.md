@@ -75,7 +75,7 @@ the persisted `Order` and passes it into `summary`.
 - **`Stage`** lists its steps in `steps = (...)` — membership, *not* order. Run order
   is derived from `depends()` and validated at class creation (an unknown target or a
   cycle raises).
-- **`Pipeline`** namespaces persistence by `output_root/name/run_id` and runs its
+- **`Pipeline`** namespaces persistence by `output_root/name` (plus `/run_id` when given) and runs its
   stages. `run(module="all")` runs everything; `module=<stage>` runs one stage,
   `module=<stage>, step=<step>` runs one step.
 
@@ -139,7 +139,8 @@ you want into your hooks instance (e.g. `LogfireHooks(run_id=...)`).
 
 | Knob | Where | Default | What it does |
 |---|---|---|---|
-| `output_root` | `Pipeline(...)` | `Path("output")` | Root dir for run output; final path is `output_root/name/run_id`. Relative paths resolve against cwd. |
+| `output_root` | `Pipeline(...)` | `Path("output")` | Root dir for run output; final path is `output_root/name`, plus `/run_id` when `run_id` is given. Relative paths resolve against cwd. |
+| `run_id` | `Pipeline(...)` | `None` | Optional per-run subdir under `output_root/name`, so separate runs don't clobber each other. Omit it and output lands directly in `output_root/name`. Ignored when you pass your own `persist_service`. |
 | `persist_service` | `Pipeline(...)` | disk backend under `output_root` | Swap in any `PersistService` (e.g. in-memory or object store); wins over `output_root`. |
 | `hooks` | `Pipeline(...)` / `Stage(...)` | `NoOpHooks()` | Context-manager hooks wrapping each step and stage — add tracing/metrics/actions with no framework tracing dep. |
 | `configure_logging(level=, fmt=)` | top-level fn | `INFO`, `"%(message)s"` | Optional stdlib logging setup so `[STEP_*]` / `[MODULE_*]` lines print. |

@@ -37,6 +37,9 @@ class Scheduler:
     (which fixes the graph); `run(run_step)` supplies how to execute a step by name."""
 
     def __init__(self, steps: tuple[Step[Any], ...], *, label: str = "") -> None:
+        """Build the dependency DAG from `steps` (which fixes run order) and validate it
+        now — unknown dep target or cycle raises here, before any run. `label` tags error
+        and warning messages, usually the stage class name."""
         self._label = label
         self._names: list[str] = [s.name for s in steps]
         self._upstreams: dict[str, set[str]] = _intra_stage_upstreams(steps)

@@ -63,6 +63,13 @@ class Stage:
             raise TypeError(f"{cls.__name__}.steps has a duplicate step.")
 
     def __init__(self, *, persist_service: PersistService, hooks: Hooks | None = None) -> None:
+        """
+        Args:
+            persist_service: Backend each step fetches its inputs from and persists its
+                output to.
+            hooks: Wraps this stage and its steps (default: no-op). A Pipeline overrides
+                this only when the Pipeline itself was given hooks.
+        """
         self._persist = persist_service
         self._hooks: Hooks = hooks or NoOpHooks()
         # name -> runner, so run_step/get_steps can target one step by name

@@ -1,0 +1,143 @@
+# stepper
+
+A tiny dependency-scheduled pipeline framework. Declare steps with `@step`, wire
+their inputs with `depends`, group them into a `Stage`, and run a `Pipeline`. Run
+order comes from the dependency graph — independent steps run concurrently — and each
+step's return value is persisted so later steps (even in later stages) read it back
+off disk.
+
+Pure stdlib + pydantic — the framework depends on no tracing library. Add spans,
+metrics, or any before/after action yourself via `Hooks` (see below).
+
+> Name note: the `stepper` name on PyPI belongs to an unrelated stepper-motor library.
+> Install this straight from git (below); it is never published to PyPI.
+
+## Install
+
+```bash
+pip install git+https://github.com/jjenkins2004/stepper.git
+```
+
+## Quickstart
+
+```python
+import asyncio
+
+from pydantic import BaseModel
+
+from stepper import Pipeline, Stage, depends, step
+
+
+class Order(BaseModel):
+    total: int
+
+
+class ExtractStage(Stage):
+    @step
+    async def build_order(self) -> Order:
+        return Order(total=100)
+
+    steps = (build_order,)
+
+
+class ReportStage(Stage):
+    @step
+    async def summary(self, order=depends(ExtractStage.build_order)) -> str:
+        return f"order total: {order.total}"
+
+    steps = (summary,)
+
+
+pipeline = Pipeline(
+    name="orders",
+    run_id="run-1",
+    output_root="output",  # writes output/orders/run-1/<Stage>/<step>.{json,txt}
+    stages={
+        "extract": lambda ps: ExtractStage(persist_service=ps),
+        "report": lambda ps: ReportStage(persist_service=ps),
+    },
+)
+
+asyncio.run(pipeline.run(module="all"))
+```
+
+This writes `output/orders/run-1/Extract/build_order.json` and
+`output/orders/run-1/Report/summary.txt`. `depends(ExtractStage.build_order)` fetches
+the persisted `Order` and passes it into `summary`.
+
+## Core concepts
+
+- **`@step`** turns an async `Stage` method into a step. Its return annotation is the
+  model persisted/fetched for it (`str` → `.txt`, anything else → `.json`). No return
+  annotation ⇒ nothing is persisted.
+- **`depends(producer)`** wires a parameter to another step's persisted output — same
+  stage (a scheduling edge) or another stage (a disk input from an earlier stage).
+- **`Stage`** lists its steps in `steps = (...)` — membership, *not* order. Run order
+  is derived from `depends()` and validated at class creation (an unknown target or a
+  cycle raises).
+- **`Pipeline`** namespaces persistence by `output_root/name/run_id` and runs its
+  stages. `run(module="all")` runs everything; `module=<stage>` runs one stage,
+  `module=<stage>, step=<step>` runs one step.
+
+## Telemetry / hooks
+
+The framework depends on no tracing library. To add spans, metrics, or any
+before/after action, pass a `Hooks` implementation to `Pipeline` (or a `Stage`). Each
+hook is a context manager wrapped around the work — code before `yield` runs before
+the step/stage, code after runs when it finishes or raises:
+
+```python
+from contextlib import contextmanager
+
+import logfire
+
+from stepper import Pipeline
+
+
+class LogfireHooks:
+    @contextmanager
+    def step(self, *, stage_name, step_name, input_type, output_type):
+        with logfire.span("step {step_name}", step_name=step_name, stage=stage_name,
+                          input_type=input_type, output_type=output_type):
+            yield
+
+    @contextmanager
+    def stage(self, *, stage_name, step_count):
+        with logfire.span("stage {stage_name}", stage_name=stage_name, step_count=step_count):
+            yield
+
+
+pipeline = Pipeline(..., hooks=LogfireHooks())
+```
+
+Exactly when each runs:
+
+- **`step(...)`** — code before `yield` runs **before** the step's inputs are fetched
+  and its body runs; code after `yield` runs **after** the body returns *and* its
+  output is persisted. If the step raises, the after-`yield` code is **skipped** and
+  the exception propagates through your context manager — use `try/except` (or
+  `try/finally`) if you need to observe failures.
+- **`stage(...)`** — before-`yield` runs before any step in the stage starts;
+  after-`yield` runs once every step has finished.
+
+The default (`NoOpHooks`) does nothing. Because tracing lives entirely in your hook,
+the framework never sees `logfire` (or a `run_id` contextvar) — bake whatever context
+you want into your hooks instance (e.g. `LogfireHooks(run_id=...)`).
+
+## Configuration
+
+| Knob | Where | Default | What it does |
+|---|---|---|---|
+| `output_root` | `Pipeline(...)` | `Path("output")` | Root dir for run output; final path is `output_root/name/run_id`. Relative paths resolve against cwd. |
+| `persist_service` | `Pipeline(...)` | disk backend under `output_root` | Swap in any `PersistService` (e.g. in-memory or object store); wins over `output_root`. |
+| `hooks` | `Pipeline(...)` / `Stage(...)` | `NoOpHooks()` | Context-manager hooks wrapping each step and stage — add tracing/metrics/actions with no framework tracing dep. |
+| `configure_logging(level=, fmt=)` | top-level fn | `INFO`, `"%(message)s"` | Optional stdlib logging setup so `[STEP_*]` / `[MODULE_*]` lines print. |
+
+## Public API
+
+`Pipeline`, `StageFactory`, `Stage`, `Step`, `step`, `depends`, `Scheduler`,
+`PersistService`, `DiskPersistService`, `Hooks`, `NoOpHooks`, `configure_logging`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -68,7 +68,8 @@ the persisted `Order` and passes it into `summary`.
 ## Core concepts
 
 - **`@step`** turns an async `Stage` method into a step. Its return annotation is the
-  model persisted/fetched for it (`str` → `.txt`, anything else → `.json`). No return
+  model persisted/fetched for it (`str` → `.txt`, `PIL.Image.Image` → a viewable image
+  file keeping its own format, PNG as fallback, anything else → `.json`). No return
   annotation ⇒ nothing is persisted.
 - **`depends(producer)`** wires a parameter to another step's persisted output — same
   stage (a scheduling edge) or another stage (a disk input from an earlier stage).

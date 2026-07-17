@@ -7,7 +7,7 @@ derived from the dependency DAG, not declaration order.
 
 from stepper.hooks import Hooks, NoOpHooks, StepReport
 from stepper.logging_config import configure_logging
-from stepper.persist import DiskPersistService, PersistService
+from stepper.persist import DiskPersistService, Persistable, PersistService
 from stepper.pipeline import Pipeline, StageFactory
 from stepper.scheduler import Scheduler
 from stepper.stage import Stage
@@ -23,6 +23,7 @@ __all__ = [
     "Scheduler",
     "PersistService",
     "DiskPersistService",
+    "Persistable",
     "Hooks",
     "NoOpHooks",
     "StepReport",

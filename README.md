@@ -68,8 +68,8 @@ the persisted `Order` and passes it into `summary`.
 ## Core concepts
 
 - **`@step`** turns an async `Stage` method into a step. Its return annotation is the
-  model persisted/fetched for it (`str` → `.txt`, `PIL.Image.Image` → a viewable image
-  file keeping its own format, PNG as fallback, anything else → `.json`). No return
+  model persisted/fetched for it — a `Persistable` also stores its own side-artifacts (on
+  the default disk backend: `str` → `.txt`, everything else → `.json`). No return
   annotation ⇒ nothing is persisted.
 - **`depends(producer)`** wires a parameter to another step's persisted output — same
   stage (a scheduling edge) or another stage (a disk input from an earlier stage).
@@ -79,6 +79,26 @@ the persisted `Order` and passes it into `summary`.
 - **`Pipeline`** namespaces persistence by `output_root/name` (plus `/run_id` when given) and runs its
   stages. `run(module="all")` runs everything; `module=<stage>` runs one stage,
   `module=<stage>, step=<step>` runs one step.
+
+## Persistence
+
+`persist(key, value, model)` / `fetch(key, model)` store and reload a step's value through
+the backend, which owns how it's encoded and where it lands — the only contract is that the
+value round-trips. The default `DiskPersistService` writes one file per key: a `str` as
+`.txt`, raw `bytes` under the key verbatim, anything else as `.json` (round-trips
+int/list/BaseModel/etc.). A value can also be a `Persistable` — a model that runs its own
+persistence on top.
+
+A `Persistable` is a `BaseModel` that hooks into the persist/fetch lifecycle. Its plain
+fields still serialize as JSON metadata; on top of that, `on_persist`/`on_fetch` let the
+model persist and reload anything else it owns (large blobs, derived artifacts, external
+references) by calling `persist`/`fetch` again with its own keys — usually `bytes` under a
+sub-key like `f"{key}/image.png"`. The key is opaque, so bake any backend naming (a file
+extension, a bucket path) into it. `persist` writes the fields, then calls
+`on_persist(service, key)`; `fetch` rebuilds the model, then calls `on_fetch(service, key)`
+so it can stash the service+key and lazy-load later. Keep the extra state in `PrivateAttr`
+so the metadata dump skips it. Consumers that need images (and PIL) build their own
+`Persistable` — stepper stays pydantic-only.
 
 ## Telemetry / hooks
 
@@ -149,8 +169,8 @@ you want into your hooks instance (e.g. `LogfireHooks(run_id=...)`).
 ## Public API
 
 `Pipeline`, `StageFactory`, `Stage`, `Step`, `step`, `depends`, `Scheduler`,
-`PersistService`, `DiskPersistService`, `Hooks`, `NoOpHooks`, `StepReport`,
-`configure_logging`.
+`PersistService`, `DiskPersistService`, `Persistable`, `Hooks`, `NoOpHooks`,
+`StepReport`, `configure_logging`.
 
 ## License
 

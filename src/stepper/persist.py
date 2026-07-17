@@ -77,7 +77,8 @@ class PersistService(ABC):
 
     def fetch(self, key: str, model: type[T]) -> T:
         """Load back the value stored under `key`, decoded as `model`. Mirror of `persist`:
-        read the value, then (for a `Persistable`) run its `on_fetch` to attach the service."""
+        read the value, then (for a `Persistable`) run its `on_fetch` to attach the service.
+        Raises if nothing is stored under `key` — the caller decides whether that's fatal."""
         value = self.read(key, model)
         if _is_persistable(model):
             cast(Persistable, value).on_fetch(self, key)

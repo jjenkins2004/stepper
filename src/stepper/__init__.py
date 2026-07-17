@@ -11,7 +11,7 @@ from stepper.persist import DiskPersistService, Persistable, PersistService
 from stepper.pipeline import Pipeline, StageFactory
 from stepper.scheduler import Scheduler
 from stepper.stage import Stage
-from stepper.step import Step, depends, step
+from stepper.step import Step, depends, optional_depends, step
 
 __all__ = [
     "Pipeline",
@@ -20,6 +20,7 @@ __all__ = [
     "Step",
     "step",
     "depends",
+    "optional_depends",
     "Scheduler",
     "PersistService",
     "DiskPersistService",

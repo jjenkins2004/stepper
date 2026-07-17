@@ -84,6 +84,7 @@ class Stage:
 
         async def run() -> Any:
             deps = step.dependencies()
+            optional = step.optional_dependencies()
             input_type = ", ".join(dep.model.__name__ if dep.model is not None else "None" for dep in deps.values()) or "None"
             output_type = step.model.__name__ if step.model is not None else "None"
             _LOGGER.info(format_step_start(step_name=step.name, input_type=input_type, output_type=output_type))
@@ -95,8 +96,16 @@ class Stage:
                     input_type=input_type,
                     output_type=output_type,
                 ) as report:
-                    # Grab the step's input based on its declared dependencies
-                    inputs = {name: self._persist.fetch(get_step_key_for(dep), dep.model) for name, dep in deps.items()}
+                    # Grab each declared input. A required dep with no persisted value
+                    # raises (as always); an optional dep with none reads back as None.
+                    inputs: dict[str, Any] = {}
+                    for name, dep in deps.items():
+                        try:
+                            inputs[name] = self._persist.fetch(get_step_key_for(dep), dep.model)
+                        except FileNotFoundError:
+                            if name not in optional:
+                                raise
+                            inputs[name] = None
 
                     # Run the step
                     result = await step.fn(self, **inputs)
@@ -127,13 +136,16 @@ class Stage:
             raise ValueError(f"Unknown step: {step_name}")
         return await runner()
 
-    async def run_steps(self) -> list[Any]:
+    async def run_steps(self, *, fail_fast: bool = False) -> list[Any]:
+        """Run every step by its dependency DAG. `fail_fast=True` cancels in-flight steps
+        and re-raises on the first failure; the default records it, skips its dependents,
+        and lets independent branches finish."""
         _LOGGER.info(format_module_start(module_name=self.stage_name, step_count=len(self._runners)))
         started = perf_counter()
         try:
             with self._hooks.stage(stage_name=self.stage_name, step_count=len(self._runners)):
                 # The scheduler owns the loop; we hand it run_step (how to run one by name).
-                return await self._scheduler.run(self.run_step)
+                return await self._scheduler.run(self.run_step, fail_fast=fail_fast)
         finally:
             elapsed_ms = int((perf_counter() - started) * 1000)
             _LOGGER.info(format_module_end(module_name=self.stage_name, elapsed_ms=elapsed_ms))

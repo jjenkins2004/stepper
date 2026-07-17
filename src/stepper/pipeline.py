@@ -37,6 +37,7 @@ class Pipeline:
         output_root: Path | str = Path("output"),
         persist_service: PersistService | None = None,
         hooks: Hooks | None = None,
+        fail_fast: bool = False,
     ) -> None:
         """
         Args:
@@ -54,9 +55,14 @@ class Pipeline:
                 is built.
             hooks: Wraps every stage and step this pipeline runs (tracing/metrics/etc.).
                 Omit and each stage keeps whatever hooks it was built with.
+            fail_fast: When True, a stage cancels its in-flight steps and re-raises on the
+                first step failure. Default False: record the failure, skip its dependents,
+                and let independent branches finish. Applies to every stage this pipeline
+                runs; a single-step run always re-raises regardless.
         """
         self.name = name
         self.run_id = run_id
+        self._fail_fast = fail_fast
         self._stage_factories = stages
         # None means "pipeline sets no hooks" — each stage keeps its own (see build_stage).
         self._hooks: Hooks | None = hooks
@@ -102,4 +108,4 @@ class Pipeline:
             if step and name == module:
                 await stage.run_step(step)
             else:
-                await stage.run_steps()
+                await stage.run_steps(fail_fast=self._fail_fast)

@@ -5,7 +5,7 @@ from inspect import iscoroutinefunction
 import pytest
 from pydantic import BaseModel
 
-from stepper.step import Step, depends, step
+from stepper.step import Step, depends, optional_depends, step
 
 from _helpers import AStage, BStage  # real Stage subclasses to use as claim() owners
 
@@ -50,6 +50,17 @@ def test_dependencies_maps_params_in_signature_order():
 
 def test_dependencies_empty_when_only_self():
     assert make_foo.dependencies() == {}
+
+
+def test_optional_depends_unwraps_to_step_but_flags_param():
+    @step
+    async def consumer(self, a=depends(make_foo), b=optional_depends(no_anno)) -> Foo: ...
+
+    # both wire to the underlying Step (schedules identically)...
+    assert consumer.dependencies() == {"a": make_foo, "b": no_anno}
+    # ...but only the optional_depends param is reported optional
+    assert consumer.optional_dependencies() == {"b"}
+    assert make_foo.optional_dependencies() == set()
 
 
 def test_dependencies_requires_depends_default():

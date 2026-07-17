@@ -73,6 +73,10 @@ the persisted `Order` and passes it into `summary`.
   annotation ⇒ nothing is persisted.
 - **`depends(producer)`** wires a parameter to another step's persisted output — same
   stage (a scheduling edge) or another stage (a disk input from an earlier stage).
+- **`optional_depends(producer)`** is `depends` typed `R | None`: if the producer's value
+  isn't persisted when this step runs, the parameter is None instead of the run raising.
+  Scheduling is unchanged — a same-stage producer is still waited for and, if it *fails*,
+  this step is still skipped; only a *missing* persisted value becomes None.
 - **`Stage`** lists its steps in `steps = (...)` — membership, *not* order. Run order
   is derived from `depends()` and validated at class creation (an unknown target or a
   cycle raises).
@@ -164,11 +168,12 @@ you want into your hooks instance (e.g. `LogfireHooks(run_id=...)`).
 | `run_id` | `Pipeline(...)` | `None` | Optional per-run subdir under `output_root/name`, so separate runs don't clobber each other. Omit it and output lands directly in `output_root/name`. Ignored when you pass your own `persist_service`. |
 | `persist_service` | `Pipeline(...)` | disk backend under `output_root` | Swap in any `PersistService` (e.g. in-memory or object store); wins over `output_root`. |
 | `hooks` | `Pipeline(...)` / `Stage(...)` | `NoOpHooks()` | Context-manager hooks wrapping each step and stage — add tracing/metrics/actions with no framework tracing dep. |
+| `fail_fast` | `Pipeline(...)` / `run_steps(...)` | `False` | `True`: a stage cancels its in-flight steps and re-raises on the first step failure. Default: record it, skip its dependents, let independent branches finish. A single-step run always re-raises. |
 | `configure_logging(level=, fmt=)` | top-level fn | `INFO`, `"%(message)s"` | Optional stdlib logging setup so `[STEP_*]` / `[MODULE_*]` lines print. |
 
 ## Public API
 
-`Pipeline`, `StageFactory`, `Stage`, `Step`, `step`, `depends`, `Scheduler`,
+`Pipeline`, `StageFactory`, `Stage`, `Step`, `step`, `depends`, `optional_depends`, `Scheduler`,
 `PersistService`, `DiskPersistService`, `Persistable`, `Hooks`, `NoOpHooks`,
 `StepReport`, `configure_logging`.
 

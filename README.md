@@ -82,7 +82,9 @@ the persisted `Order` and passes it into `summary`.
   cycle raises).
 - **`Pipeline`** namespaces persistence by `output_root/name` (plus `/run_id` when given) and runs its
   stages. `run(module="all")` runs everything; `module=<stage>` runs one stage,
-  `module=<stage>, step=<step>` runs one step.
+  `module=<stage>, step=<step>` runs one step. `run` returns the last thing it ran — a
+  single step's value, or the final stage's step results — so callers can read the final
+  output without going back to the `PersistService`.
 
 ## Persistence
 
@@ -90,7 +92,9 @@ the persisted `Order` and passes it into `summary`.
 the backend, which owns how it's encoded and where it lands — the only contract is that the
 value round-trips. The default `DiskPersistService` writes one file per key: a `str` as
 `.txt`, raw `bytes` under the key verbatim, anything else as `.json` (round-trips
-int/list/BaseModel/etc.). A value can also be a `Persistable` — a model that runs its own
+int/list/BaseModel/etc.). `InMemoryPersistService` is the same encoding into a dict instead
+of files — no disk at all, for a single run whose output must not be written anywhere (pass
+it as `persist_service=`). A value can also be a `Persistable` — a model that runs its own
 persistence on top.
 
 A `Persistable` is a `BaseModel` that hooks into the persist/fetch lifecycle. Its plain

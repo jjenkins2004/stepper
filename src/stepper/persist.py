@@ -16,6 +16,10 @@ the keys it passes.
 one file per key: a `str` as `<key>.txt`, raw `bytes` as `<key>` verbatim, everything else
 as `<key>.json` (round-trips int/list/BaseModel). `base_dir` is required — the caller owns
 where output lands.
+
+`InMemoryPersistService` is the same encoding into a plain dict instead of files — nothing
+touches disk. Use it for a single server-side run whose output must not be written anywhere;
+the store is discarded with the instance.
 """
 
 from __future__ import annotations
@@ -116,3 +120,38 @@ class DiskPersistService(PersistService):
         if model is bytes:
             return cast(T, (self._base / key).read_bytes())
         return TypeAdapter(model).validate_json((self._base / f"{key}.json").read_bytes())
+
+
+class InMemoryPersistService(PersistService):
+    """`PersistService` backed by a plain dict — nothing touches disk or any external store.
+
+    For a single server-side run whose output must not be written anywhere: the store lives
+    only as long as the instance. Encodes exactly like `DiskPersistService` so the two are
+    interchangeable — a value is serialized on `write` (`str` verbatim, `bytes` verbatim,
+    everything else to JSON) and decoded on `read`. Serializing (not stashing the live
+    object) mirrors disk: a read returns an independent copy, so one step can't mutate an
+    earlier step's persisted value. `run_id` is metadata only — the dict is already per-run.
+    """
+
+    def __init__(self, *, run_id: str | None = None) -> None:
+        super().__init__(run_id=run_id)
+        self._store: dict[str, str | bytes] = {}
+
+    def write(self, key: str, value: T, model: type[T]) -> None:
+        if model is str:
+            self._store[key] = cast(str, value)
+        elif model is bytes:
+            self._store[key] = cast(bytes, value)
+        else:
+            self._store[key] = TypeAdapter(model).dump_json(value)
+
+    def read(self, key: str, model: type[T]) -> T:
+        try:
+            raw = self._store[key]
+        except KeyError:
+            # Mirror the disk backend: a missing value raises FileNotFoundError, so an
+            # optional dep reads back as None instead of raising (see the Stage runner).
+            raise FileNotFoundError(key) from None
+        if model is str or model is bytes:
+            return cast(T, raw)
+        return TypeAdapter(model).validate_json(cast(bytes, raw))

@@ -73,3 +73,21 @@ def test_routing_key_independent_of_stage_name(make_pipeline, run):
     assert p.persist_service.fetch("A/prod", Item) == Item(value=1)  # storage keys off class
     with pytest.raises(ValueError, match="has no stage 'A'"):
         run(p.run(module="A"))
+
+
+# --- run() returns the last thing it ran (final output, no PersistService poke) ----
+
+
+def test_run_all_returns_final_stage_results(make_pipeline, run):
+    # last stage is B (consume -> Item(2), note -> "got 2"); results in declaration order.
+    assert run(make_pipeline().run(module="all")) == [Item(value=2), "got 2"]
+
+
+def test_run_single_stage_returns_its_results(make_pipeline, run):
+    assert run(make_pipeline().run(module="a")) == [Item(value=1)]
+
+
+def test_run_single_step_returns_that_step_value(make_pipeline, run):
+    p = make_pipeline()
+    run(p.run(module="a"))                       # seed A/prod for the cross-stage dep
+    assert run(p.run(module="b", step="consume")) == Item(value=2)

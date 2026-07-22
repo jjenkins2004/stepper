@@ -13,7 +13,7 @@ cwd) or hand in your own `persist_service` for a non-disk backend.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from stepper.hooks import Hooks
 from stepper.persist import DiskPersistService, PersistService
@@ -101,11 +101,17 @@ class Pipeline:
             return tuple(self.stage_names())
         return (module,)
 
-    async def run(self, *, module: str, step: str | None = None) -> None:
-        """Run the whole pipeline (``module="all"``), one stage, or one step."""
+    async def run(self, *, module: str, step: str | None = None) -> Any:
+        """Run the whole pipeline (``module="all"``), one stage, or one step, and return
+        the last thing run — so a caller can read a pipeline's final output without going
+        back to the PersistService. A single-step run returns that step's value; a stage or
+        ``"all"`` run returns the final stage's step results (a list, in declaration order,
+        from `Stage.run_steps`)."""
+        result: Any = None
         for name in self._resolve_stage_names(module, step):
             stage = self.build_stage(name)
             if step and name == module:
-                await stage.run_step(step)
+                result = await stage.run_step(step)
             else:
-                await stage.run_steps(fail_fast=self._fail_fast)
+                result = await stage.run_steps(fail_fast=self._fail_fast)
+        return result

@@ -12,15 +12,18 @@ persisted value (typed as its return type). A `depends()` may point at a step on
 another stage — that value is already on disk from the earlier stage, so it's an
 input, not a scheduling edge within this stage.
 
-Add tracing/telemetry by passing a `Hooks` implementation (default: no-op); each step
-and each stage run is wrapped in the matching hook context manager.
+Add tracing/telemetry by passing a `Hooks` implementation, or several as a sequence
+(default: no-op); each step and each stage run is wrapped in every hook's matching
+context manager (entered in order, exited in reverse).
 """
 
 import logging
+from collections.abc import Sequence
+from contextlib import ExitStack
 from time import perf_counter
 from typing import Any, Callable, ClassVar, Coroutine
 
-from stepper.hooks import Hooks, NoOpHooks
+from stepper.hooks import Hooks
 from stepper.persist import PersistService
 from stepper.scheduler import Scheduler
 from stepper.step import Step
@@ -33,6 +36,16 @@ from stepper.step_logging import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_hooks(hooks: Hooks | Sequence[Hooks] | None) -> tuple[Hooks, ...]:
+    """Coerce the public `hooks` arg to an internal tuple: None -> (), a lone `Hooks` -> a
+    1-tuple, a sequence -> its tuple. A single hook then runs exactly as it did before."""
+    if hooks is None:
+        return ()
+    if isinstance(hooks, Sequence):
+        return tuple(hooks)
+    return (hooks,)
 
 
 class Stage:
@@ -62,16 +75,20 @@ class Stage:
         if len(set(cls.steps)) != len(cls.steps):
             raise TypeError(f"{cls.__name__}.steps has a duplicate step.")
 
-    def __init__(self, *, persist_service: PersistService, hooks: Hooks | None = None) -> None:
+    def __init__(
+        self, *, persist_service: PersistService, hooks: Hooks | Sequence[Hooks] | None = None
+    ) -> None:
         """
         Args:
             persist_service: Backend each step fetches its inputs from and persists its
                 output to.
-            hooks: Wraps this stage and its steps (default: no-op). A Pipeline overrides
-                this only when the Pipeline itself was given hooks.
+            hooks: One `Hooks`, a sequence of them, or None (default: no-op). Several are
+                fanned out — entered in order, exited in reverse — and each receives the
+                step output directly. A Pipeline overrides this only when the Pipeline
+                itself was given hooks.
         """
         self._persist = persist_service
-        self._hooks: Hooks = hooks or NoOpHooks()
+        self._hooks: tuple[Hooks, ...] = _normalize_hooks(hooks)
         # name -> runner, so run_step/get_steps can target one step by name
         self._runners: dict[str, Callable[[], Coroutine[Any, Any, Any]]] = {
             step.name: self._get_runner_for(step) for step in self.steps
@@ -90,12 +107,21 @@ class Stage:
             _LOGGER.info(format_step_start(step_name=step.name, input_type=input_type, output_type=output_type))
             started = perf_counter()
             try:
-                with self._hooks.step(
-                    stage_name=self.stage_name,
-                    step_name=step.name,
-                    input_type=input_type,
-                    output_type=output_type,
-                ) as report:
+                with ExitStack() as stack:
+                    # Enter every hook's step() in order (ExitStack exits them in reverse).
+                    # One hook behaves exactly as before; () is a clean no-op. A raise in
+                    # __enter__/__exit__ unwinds the already-entered hooks with it.
+                    reports = [
+                        stack.enter_context(
+                            hook.step(
+                                stage_name=self.stage_name,
+                                step_name=step.name,
+                                input_type=input_type,
+                                output_type=output_type,
+                            )
+                        )
+                        for hook in self._hooks
+                    ]
                     # Grab each declared input. A required dep with no persisted value
                     # raises (as always); an optional dep with none reads back as None.
                     inputs: dict[str, Any] = {}
@@ -107,15 +133,16 @@ class Stage:
                                 raise
                             inputs[name] = None
 
-                    # Run the step
+                    # Run the step once
                     result = await step.fn(self, **inputs)
 
-                    # Persist the result if the step declares an output model
+                    # Persist the result if the step declares an output model, then hand it
+                    # to each hook's StepReport (skipping any hook that yielded None).
                     if step.model is not None:
                         self._persist.persist(get_step_key_for(step), result, step.model)
-                        # Hand the output to the hook's StepReport (if it yielded one).
-                        if report is not None:
-                            report.set_output(result)
+                        for report in reports:
+                            if report is not None:
+                                report.set_output(result)
             except Exception as exc:
                 elapsed_ms = int((perf_counter() - started) * 1000)
                 _LOGGER.exception(format_step_fail(step_name=step.name, elapsed_ms=elapsed_ms, error_type=type(exc).__name__))
@@ -143,7 +170,12 @@ class Stage:
         _LOGGER.info(format_module_start(module_name=self.stage_name, step_count=len(self._runners)))
         started = perf_counter()
         try:
-            with self._hooks.stage(stage_name=self.stage_name, step_count=len(self._runners)):
+            with ExitStack() as stack:
+                # Fan out to every hook's stage() (enter in order, exit in reverse).
+                for hook in self._hooks:
+                    stack.enter_context(
+                        hook.stage(stage_name=self.stage_name, step_count=len(self._runners))
+                    )
                 # The scheduler owns the loop; we hand it run_step (how to run one by name).
                 return await self._scheduler.run(self.run_step, fail_fast=fail_fast)
         finally:

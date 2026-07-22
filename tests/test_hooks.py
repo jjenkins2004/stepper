@@ -186,6 +186,184 @@ def test_default_hooks_are_noop(persist, run):
     assert results == [Item(value=1)]
 
 
+class TaggedHooks:
+    """Like `TimelineHooks`, but tags each entry with a hook id so a shared timeline
+    pins down fan-out order across two hooks (enter forward, exit reverse)."""
+
+    def __init__(self, tag: str, timeline: list[str]):
+        self.tag = tag
+        self.timeline = timeline
+
+    @contextmanager
+    def step(self, *, stage_name, step_name, input_type, output_type):
+        self.timeline.append(f"{self.tag}:step-before:{step_name}")
+        try:
+            yield
+        except Exception:
+            self.timeline.append(f"{self.tag}:step-error:{step_name}")
+            raise
+        else:
+            self.timeline.append(f"{self.tag}:step-after:{step_name}")
+
+    @contextmanager
+    def stage(self, *, stage_name, step_count):
+        self.timeline.append(f"{self.tag}:stage-before:{stage_name}")
+        try:
+            yield
+        finally:
+            self.timeline.append(f"{self.tag}:stage-after:{stage_name}")
+
+
+def test_empty_hooks_list_is_noop(persist, run):
+    # [] normalizes to () — no hooks entered, step runs and persists as usual.
+    results = run(AStage(persist_service=persist, hooks=[]).run_steps())
+    assert results == [Item(value=1)]
+
+
+def test_two_hooks_fan_out_enter_forward_exit_reverse(persist, run):
+    """Both hooks bracket the stage and the step; entered in list order, exited in
+    reverse (ExitStack default)."""
+    timeline: list[str] = []
+
+    @step
+    async def work(self) -> Item:
+        timeline.append("body:work")
+        return Item(value=1)
+
+    class WorkStage(Stage):
+        steps = (work,)
+
+    a, b = TaggedHooks("A", timeline), TaggedHooks("B", timeline)
+    run(WorkStage(persist_service=persist, hooks=[a, b]).run_steps())
+    assert timeline == [
+        "A:stage-before:Work", "B:stage-before:Work",   # enter forward
+        "A:step-before:work", "B:step-before:work",     # enter forward
+        "body:work",
+        "B:step-after:work", "A:step-after:work",       # exit reverse
+        "B:stage-after:Work", "A:stage-after:Work",     # exit reverse
+    ]
+
+
+def test_two_hooks_both_receive_step_output(persist, run):
+    """Each hook's own StepReport is filled with the step's return value — no middleman."""
+    cap_a: dict = {}
+    cap_b: dict = {}
+    run(AStage(persist_service=persist, hooks=[_OutputHooks(cap_a), _OutputHooks(cap_b)]).run_step("prod"))
+    for cap in (cap_a, cap_b):
+        assert cap["has_output"] is True
+        assert cap["output"] == Item(value=1)
+
+
+def test_hook_yielding_no_report_is_tolerated(persist, run):
+    """A hook that yields nothing sits alongside one that yields a StepReport; the
+    report-yielding hook still receives the output, the other is simply skipped."""
+    cap: dict = {}
+
+    class NoReportHooks:
+        @contextmanager
+        def step(self, *, stage_name, step_name, input_type, output_type):
+            yield  # yields None — no StepReport to fill
+        @contextmanager
+        def stage(self, *, stage_name, step_count):
+            yield
+
+    run(AStage(persist_service=persist, hooks=[NoReportHooks(), _OutputHooks(cap)]).run_step("prod"))
+    assert cap["has_output"] is True
+    assert cap["output"] == Item(value=1)
+
+
+def test_two_hooks_both_see_step_failure_and_it_reraises(persist, run):
+    """A raising step body propagates into every entered hook at its yield (reverse
+    order), and the exception re-raises out of the run."""
+    timeline: list[str] = []
+
+    @step
+    async def boom(self) -> Item:
+        timeline.append("body:boom")
+        raise RuntimeError("kaboom")
+
+    class BoomStage(Stage):
+        steps = (boom,)
+
+    a, b = TaggedHooks("A", timeline), TaggedHooks("B", timeline)
+    with pytest.raises(RuntimeError, match="kaboom"):
+        run(BoomStage(persist_service=persist, hooks=[a, b]).run_step("boom"))
+    assert timeline == [
+        "A:step-before:boom", "B:step-before:boom",
+        "body:boom",
+        "B:step-error:boom", "A:step-error:boom",  # both see it, reverse order; no step-after
+    ]
+
+
+def test_hook_enter_failure_unwinds_entered_hooks(persist, run):
+    """The sharp edge: a hook raising in __enter__ unwinds the already-entered hooks with
+    that exception (they see it at their yield), the step body never runs, and it re-raises."""
+    timeline: list[str] = []
+
+    @step
+    async def work(self) -> Item:
+        timeline.append("body:work")
+        return Item(value=1)
+
+    class WorkStage(Stage):
+        steps = (work,)
+
+    class BadEnter:
+        @contextmanager
+        def step(self, *, stage_name, step_name, input_type, output_type):
+            timeline.append("B:enter-boom")
+            raise RuntimeError("enter-boom")
+            yield  # unreachable — makes step() a generator context manager
+        @contextmanager
+        def stage(self, *, stage_name, step_count):
+            yield
+
+    good = TaggedHooks("A", timeline)
+    with pytest.raises(RuntimeError, match="enter-boom"):
+        run(WorkStage(persist_service=persist, hooks=[good, BadEnter()]).run_step("work"))
+    assert timeline == [
+        "A:step-before:work",  # first hook entered
+        "B:enter-boom",        # second hook blew up in __enter__
+        "A:step-error:work",   # first hook unwound with that exception
+    ]
+    assert "body:work" not in timeline  # step never ran
+
+
+def test_hook_exit_failure_propagates_to_other_hook(persist, run):
+    """The sharp edge, exit side: a hook raising in __exit__ propagates into the
+    remaining entered hooks (reverse order) and re-raises."""
+    timeline: list[str] = []
+
+    @step
+    async def work(self) -> Item:
+        timeline.append("body:work")
+        return Item(value=1)
+
+    class WorkStage(Stage):
+        steps = (work,)
+
+    class BadExit:
+        @contextmanager
+        def step(self, *, stage_name, step_name, input_type, output_type):
+            timeline.append("B:step-before:work")
+            yield
+            timeline.append("B:exit-boom")
+            raise RuntimeError("exit-boom")
+        @contextmanager
+        def stage(self, *, stage_name, step_count):
+            yield
+
+    good = TaggedHooks("A", timeline)
+    with pytest.raises(RuntimeError, match="exit-boom"):
+        run(WorkStage(persist_service=persist, hooks=[good, BadExit()]).run_step("work"))
+    assert timeline == [
+        "A:step-before:work", "B:step-before:work",
+        "body:work",
+        "B:exit-boom",         # last-entered exits first and raises
+        "A:step-error:work",   # exception thrown into the remaining hook
+    ]
+
+
 def test_pipeline_applies_hooks_to_all_stages(tmp_path, run):
     timeline: list[str] = []
     p = Pipeline(
@@ -207,5 +385,27 @@ def test_pipeline_applies_hooks_to_all_stages(tmp_path, run):
         "step-before:prod", "step-after:prod",
         "step-before:consume", "step-after:consume",
         "step-before:note", "step-after:note",
+    ):
+        assert event in timeline
+
+
+def test_pipeline_applies_a_list_of_hooks_to_all_stages(tmp_path, run):
+    """A sequence handed to the Pipeline is normalized and both hooks wrap every stage/step."""
+    timeline: list[str] = []
+    p = Pipeline(
+        name="p",
+        run_id="r",
+        output_root=tmp_path,
+        hooks=[TaggedHooks("A", timeline), TaggedHooks("B", timeline)],
+        stages={
+            "a": lambda ps: AStage(persist_service=ps),
+            "b": lambda ps: BStage(persist_service=ps),
+        },
+    )
+    run(p.run(module="all"))
+    for event in (
+        "A:stage-before:A", "B:stage-before:A", "A:stage-after:A", "B:stage-after:A",
+        "A:step-before:prod", "B:step-before:prod", "A:step-after:prod", "B:step-after:prod",
+        "A:step-before:note", "B:step-before:note",
     ):
         assert event in timeline

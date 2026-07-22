@@ -142,6 +142,12 @@ class LogfireHooks:
 pipeline = Pipeline(..., hooks=LogfireHooks())
 ```
 
+**Running several hooks.** Pass a list — `hooks=[LogfireHooks(), StreamHooks(reducer)]`
+(on a `Pipeline` or a `Stage`) — and stepper fans out natively: no composite wrapper.
+Each is entered before the step/stage in list order and exited in reverse, an exception
+propagates into every one at its `yield`, and each gets the step output in its own
+`StepReport`. A lone `hooks=SomeHooks()` behaves exactly as one hook always has.
+
 **Capturing a step's output.** The output only exists *after* the step runs (after your
 `yield`), so you can't yield it. Instead yield a `StepReport`: the framework calls
 `report.set_output(result)` once the step has run and persisted, and your after-`yield`
@@ -171,7 +177,7 @@ you want into your hooks instance (e.g. `LogfireHooks(run_id=...)`).
 | `output_root` | `Pipeline(...)` | `Path("output")` | Root dir for run output; final path is `output_root/name`, plus `/run_id` when `run_id` is given. Relative paths resolve against cwd. |
 | `run_id` | `Pipeline(...)` | `None` | Optional per-run subdir under `output_root/name`, so separate runs don't clobber each other. Omit it and output lands directly in `output_root/name`. Ignored when you pass your own `persist_service`. |
 | `persist_service` | `Pipeline(...)` | disk backend under `output_root` | Swap in any `PersistService` (e.g. in-memory or object store); wins over `output_root`. |
-| `hooks` | `Pipeline(...)` / `Stage(...)` | `NoOpHooks()` | Context-manager hooks wrapping each step and stage — add tracing/metrics/actions with no framework tracing dep. |
+| `hooks` | `Pipeline(...)` / `Stage(...)` | `NoOpHooks()` | One `Hooks` or a list of them, wrapping each step and stage — add tracing/metrics/actions with no framework tracing dep. Several fan out: entered in order, exited in reverse. |
 | `fail_fast` | `Pipeline(...)` / `run_steps(...)` | `False` | `True`: a stage cancels its in-flight steps and re-raises on the first step failure. Default: record it, skip its dependents, let independent branches finish. A single-step run always re-raises. |
 | `configure_logging(level=, fmt=)` | top-level fn | `INFO`, `"%(message)s"` | Optional stdlib logging setup so `[STEP_*]` / `[MODULE_*]` lines print. |
 

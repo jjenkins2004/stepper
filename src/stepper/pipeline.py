@@ -12,12 +12,13 @@ cwd) or hand in your own `persist_service` for a non-disk backend.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Callable
 
 from stepper.hooks import Hooks
 from stepper.persist import DiskPersistService, PersistService
-from stepper.stage import Stage
+from stepper.stage import Stage, _normalize_hooks
 
 # Builds a stage from the shared PersistService. Per-run inputs (e.g. a
 # spreadsheet path) are baked into the closure by the pipeline's wiring.
@@ -36,7 +37,7 @@ class Pipeline:
         run_id: str | None = None,
         output_root: Path | str = Path("output"),
         persist_service: PersistService | None = None,
-        hooks: Hooks | None = None,
+        hooks: Hooks | Sequence[Hooks] | None = None,
         fail_fast: bool = False,
     ) -> None:
         """
@@ -53,8 +54,9 @@ class Pipeline:
             persist_service: Bring-your-own backend (in-memory, object store, DB). When
                 given it wins — `output_root`/`run_id` are ignored and no disk backend
                 is built.
-            hooks: Wraps every stage and step this pipeline runs (tracing/metrics/etc.).
-                Omit and each stage keeps whatever hooks it was built with.
+            hooks: One `Hooks`, a sequence of them, or None. Wraps every stage and step
+                this pipeline runs (tracing/metrics/etc.); several are fanned out. Omit
+                and each stage keeps whatever hooks it was built with.
             fail_fast: When True, a stage cancels its in-flight steps and re-raises on the
                 first step failure. Default False: record the failure, skip its dependents,
                 and let independent branches finish. Applies to every stage this pipeline
@@ -65,7 +67,8 @@ class Pipeline:
         self._fail_fast = fail_fast
         self._stage_factories = stages
         # None means "pipeline sets no hooks" — each stage keeps its own (see build_stage).
-        self._hooks: Hooks | None = hooks
+        # Otherwise normalize to a tuple, the same shape stages hold internally.
+        self._hooks: tuple[Hooks, ...] | None = None if hooks is None else _normalize_hooks(hooks)
         # Explicit persist_service wins; otherwise a disk backend rooted at
         # output_root/name, handed run_id so it lands per-run output under it.
         self.persist_service: PersistService = persist_service or DiskPersistService(

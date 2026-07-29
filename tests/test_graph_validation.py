@@ -829,6 +829,41 @@ def optional_self_dependency_on_a_self_loop():
     return S
 
 
+def dep_on_a_step_that_persists_nothing():
+    """`b` requires `a`, and the graph enters at `b` — which would be rejected for a
+    normal producer. `a` produces nothing, so there is no fetch that could fail and the
+    every-path rule doesn't apply."""
+    class S(Stage):
+        @step
+        async def a(self) -> None: ...
+
+        @step
+        async def b(self, _done=depends(a)) -> V:
+            return _v()
+
+        steps = (a, b)
+        edges = (edge(START).to(b), edge(b).to(a), edge(a).to(EXIT))
+
+    return S
+
+
+def optional_dep_on_a_step_that_persists_nothing():
+    """Same exemption on the optional side: nothing to fetch, so the reachability rule
+    that would otherwise reject this wiring doesn't apply either."""
+    class S(Stage):
+        @step
+        async def a(self) -> None: ...
+
+        @step
+        async def b(self, _done=optional_depends(a), prev=optional_depends("b")) -> V:
+            return _v()
+
+        steps = (a, b)
+        edges = (edge(START).to(b), edge(b).to(a), edge(a).when(lambda r: True).to(EXIT).otherwise(b))
+
+    return S
+
+
 def cross_stage_optional_dep():
     class Upstream(Stage):
         @step
@@ -854,6 +889,8 @@ VALID = [
     two_back_edges_into_one_head,
     diamond_with_a_cycle,
     optional_self_dependency_on_a_self_loop,
+    dep_on_a_step_that_persists_nothing,
+    optional_dep_on_a_step_that_persists_nothing,
     cross_stage_optional_dep,
     self_loop_with_exit,
     two_step_cycle_with_back_edge_dep,

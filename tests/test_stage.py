@@ -3,7 +3,7 @@
 import pytest
 
 from stepper.stage import Stage
-from stepper.step import Step, depends, step
+from stepper.step import Step, depends, optional_depends, step
 
 from _helpers import AStage, BStage, Item
 
@@ -112,6 +112,62 @@ def test_model_none_step_is_not_persisted(persist, tmp_path, run):
 
     run(SilentStage(persist_service=persist).run_step("noop"))
     assert not (tmp_path / "Silent").exists()
+
+
+def test_depends_on_a_step_that_persists_nothing_orders_and_passes_none(persist, run):
+    """A producer with no output model is an *ordering* dependency: it still schedules
+    ahead of its consumer, and the parameter is None because there was never a value.
+    `depends()` on a `Step[None]` is typed `None`, so nothing can misuse it."""
+    order = []
+
+    @step
+    async def side_effect(self) -> None:
+        order.append("side_effect")
+
+    @step
+    async def after(self, _done=depends(side_effect)) -> Item:
+        order.append(("after", _done))
+        return Item(value=1)
+
+    class OrderStage(Stage):
+        steps = (after, side_effect)          # declaration order deliberately reversed
+
+    # Declaration order; `side_effect`'s own (unpersisted) return still shows up.
+    assert run(OrderStage(persist_service=persist).run_steps()) == [Item(value=1), None]
+    assert order == ["side_effect", ("after", None)]   # ordered, and the param is None
+
+
+def test_optional_depends_on_a_step_that_persists_nothing_is_also_none(persist, run):
+    @step
+    async def side_effect(self) -> None: ...
+
+    @step
+    async def after(self, _done=optional_depends(side_effect)) -> Item:
+        assert _done is None
+        return Item(value=2)
+
+    class OptOrderStage(Stage):
+        steps = (side_effect, after)
+
+    assert run(OptOrderStage(persist_service=persist).run_steps()) == [None, Item(value=2)]
+
+
+def test_unannotated_producer_also_passes_none(persist, run):
+    """`-> None` and no annotation both mean "persists nothing" — same behavior."""
+
+    @step
+    async def bare(self):
+        return "thrown away"
+
+    @step
+    async def reader(self, _done=depends(bare)) -> Item:
+        assert _done is None
+        return Item(value=3)
+
+    class BareStage(Stage):
+        steps = (bare, reader)
+
+    assert run(BareStage(persist_service=persist).run_steps()) == ["thrown away", Item(value=3)]
 
 
 def test_run_step_returns_value_and_reads_seeded_dep(persist, run):

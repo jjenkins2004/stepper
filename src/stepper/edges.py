@@ -336,13 +336,16 @@ class Graph:
         for s in steps:
             opt_params = s.optional_dependencies()
             deps = s.dependencies()
+            # A producer that persists nothing is never fetched, so neither rule applies:
+            # the dep is pure ordering, and in an edge-driven stage the edges already own
+            # that. Nothing about the graph can make it fail.
             required[s.name] = {
                 dep.name for param, dep in deps.items()
-                if param not in opt_params and dep in member_steps
+                if param not in opt_params and dep in member_steps and dep.model is not None
             }
             optional.extend(
                 (s.name, dep.name) for param, dep in deps.items()
-                if param in opt_params and dep in member_steps
+                if param in opt_params and dep in member_steps and dep.model is not None
             )
 
         preds = self._predecessors(names)

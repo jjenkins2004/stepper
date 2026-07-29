@@ -184,6 +184,12 @@ class Stage:
                     # raises (as always); an optional dep with none reads back as None.
                     inputs: dict[str, Any] = {}
                     for name, dep in deps.items():
+                        if dep.model is None:
+                            # Producer persists nothing, so there is nothing to fetch —
+                            # the dep is pure ordering and the parameter is None. Typed
+                            # that way too, since `depends()` on a `Step[None]` is None.
+                            inputs[name] = None
+                            continue
                         try:
                             inputs[name] = self._persist.fetch(self._key_for(dep), dep.model)
                         except FileNotFoundError:

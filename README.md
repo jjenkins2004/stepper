@@ -75,6 +75,9 @@ the persisted `Order` and passes it into `summary`.
   stage (a scheduling edge) or another stage (a disk input from an earlier stage). A step
   *name* works too, resolved at class creation, for a producer defined further down the
   class body (see [Loops](#loops)).
+  A producer that persists nothing (no return annotation, or `-> None`) still works: the
+  dependency is pure ordering — the consumer runs after it — and the parameter is `None`,
+  typed that way since `depends()` on a `Step[None]` *is* `None`.
 - **`optional_depends(producer)`** is `depends` typed `R | None`: if the producer's value
   isn't persisted when this step runs, the parameter is None instead of the run raising.
   Scheduling is unchanged — a same-stage producer is still waited for and, if it *fails*,
@@ -167,6 +170,9 @@ broken as a graph with no `EXIT` at all, it just takes a run to find out.
   on *at least one* path. `optional_depends` exists so a first pass can read None, not so
   a parameter can be None forever; if nothing ever routes from producer to consumer, the
   wiring is dead and gets rejected too.
+- **A producer that persists nothing** is exempt from both — there is no fetch that could
+  fail. Inside an edge-driven stage such a dependency is documentation, since the edges
+  already fix the order.
 
 That asymmetry is what makes a back edge legal: in `START → b`, `b → a`, `a → b`, the
 second visit to `b` does have `a` behind it, so the optional read is meaningful even though

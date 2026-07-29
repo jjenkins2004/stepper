@@ -313,6 +313,36 @@ def test_follow_edges_on_a_dag_stage_raises_through_the_pipeline(run, tmp_path):
         run(p.run(stage="b", step="note", follow_edges=True))
 
 
+def test_side_effect_step_in_a_graph_passes_none_and_still_runs(run, tmp_path):
+    """A step that produces nothing is fine inside a graph: it runs, persists nothing,
+    and a `depends()` on it reads back as None instead of raising."""
+    order = []
+
+    class SideStage(Stage):
+        @step
+        async def wipe(self) -> None:
+            order.append("wipe")
+
+        @step
+        async def rebuild(self, _wiped=depends(wipe), prev=optional_depends("rebuild")) -> V:
+            order.append(("rebuild", _wiped))
+            return V(n=0 if prev is None else prev.n + 1)
+
+        steps = (wipe, rebuild)
+        edges = (
+            edge(START).to(wipe),
+            edge(wipe).to(rebuild),
+            edge(rebuild).when(lambda r: r.n >= 1).to(EXIT).otherwise(wipe),
+        )
+
+    persist = DiskPersistService(base_dir=tmp_path)
+    run(SideStage(persist_service=persist).run_steps())
+
+    assert order == ["wipe", ("rebuild", None), "wipe", ("rebuild", None)]
+    assert not (tmp_path / "Side" / "wipe.json").exists()      # produced nothing
+    assert (tmp_path / "Side" / "rebuild.json").exists()
+
+
 def test_edge_stage_returns_only_what_it_ran(run, tmp_path):
     """A resumed run reports the tail it executed, in declaration order — the same
     partial-result shape a DAG run has when not every step ran."""

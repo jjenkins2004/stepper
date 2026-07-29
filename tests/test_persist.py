@@ -112,7 +112,7 @@ def test_persistable_flows_through_pipeline(tmp_path, run):
             "consume": lambda ps: ConsumeStage(persist_service=ps),
         },
     )
-    run(p.run(module="all"))
+    run(p.run(stage="all"))
 
     base = tmp_path / "p" / "r1"  # output_root/name/run_id
     assert (base / "Produce" / "doc.json").exists()

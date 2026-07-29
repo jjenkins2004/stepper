@@ -1,6 +1,6 @@
 """Scheduler — dependency DAG build/validation + the concurrent run loop.
 
-Unit tests drive `SomeStage._scheduler.run(callback)` directly with a recording/gate
+Unit tests drive `sched(SomeStage).run(callback)` directly with a recording/gate
 callback — no persist, no Stage instance (`_scheduler` is a ClassVar). Concurrency is
 proven deterministically with asyncio barriers/gates (serialized execution => deadlock
 => `wait_for` timeout => failure), never with timing sleeps.
@@ -19,6 +19,13 @@ from stepper.step import Step, depends, step
 from _helpers import AStage, Item
 
 
+def sched(stage_cls):
+    """The stage's DAG scheduler. It's None for a stage that declares `edges` and orders
+    itself, so narrow it here — every stage in this file is a DAG stage."""
+    assert stage_cls._scheduler is not None
+    return stage_cls._scheduler
+
+
 # --- graph build / validation (at Scheduler construction) ---
 
 def test_upstreams_exclude_cross_stage_dep_keep_same_stage():
@@ -34,7 +41,7 @@ def test_upstreams_exclude_cross_stage_dep_keep_same_stage():
         steps = (base, mixed)
 
     # cross-stage dep (AStage.prod) is a disk input, not a scheduling edge; same-stage dep is.
-    assert Mix._scheduler._upstreams == {"base": set(), "mixed": {"base"}}
+    assert sched(Mix)._upstreams == {"base": set(), "mixed": {"base"}}
 
 
 def test_missing_dependency_raises():
@@ -90,7 +97,7 @@ def test_execution_follows_deps_return_follows_declaration_order(run):
         order.append(name)
         return name
 
-    result = run(Chain._scheduler.run(cb))
+    result = run(sched(Chain).run(cb))
     assert order == ["a", "b", "c"]    # execution follows deps, tuple order ignored
     assert result == ["c", "a", "b"]   # return follows declaration order, NOT completion order
 
@@ -124,7 +131,7 @@ def test_diamond_runs_upstreams_concurrently_and_joins(run):
         order.append(name)
         return name
 
-    run(asyncio.wait_for(Diamond._scheduler.run(cb), 1.0))
+    run(asyncio.wait_for(sched(Diamond).run(cb), 1.0))
     assert order[0] == "a"            # root first
     assert order[-1] == "d"           # join waits for both b and c
     assert set(order) == {"a", "b", "c", "d"}
@@ -162,7 +169,7 @@ def test_failed_step_skips_join_and_dependents_independent_completes(run):
             raise RuntimeError("boom failed")
         return name
 
-    result = run(asyncio.wait_for(F._scheduler.run(cb), 1.0))
+    result = run(asyncio.wait_for(sched(F).run(cb), 1.0))
     # boom fails; join needs ALL upstreams (b AND boom) so it skips; b and indep still complete.
     assert result == ["a", "b", "indep"]  # declaration order, boom + join absent
     assert "join" not in order            # never launched (a failed upstream, not just any)
@@ -197,5 +204,5 @@ def test_fail_fast_raises_and_cancels_inflight(run):
         return name
 
     with pytest.raises(RuntimeError, match="boom failed"):
-        run(asyncio.wait_for(FF._scheduler.run(cb, fail_fast=True), 1.0))
+        run(asyncio.wait_for(sched(FF).run(cb, fail_fast=True), 1.0))
     assert saw_cancel["v"] is True  # the running sibling was cancelled, not left leaking

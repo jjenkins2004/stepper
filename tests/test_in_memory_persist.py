@@ -161,7 +161,7 @@ def test_injected_backend_runs_pipeline_without_touching_disk(tmp_path, run):
             "consume": lambda ps: ConsumeStage(persist_service=ps),
         },
     )
-    run(p.run(module="all"))
+    run(p.run(stage="all"))
 
     assert p.persist_service is svc                       # injected backend won
     assert svc.fetch("Consume/read", str) == "report:payload"
@@ -188,5 +188,5 @@ def test_optional_dep_missing_reads_as_none(run):
         persist_service=svc,
         stages={"maybe": lambda ps: MaybeStage(persist_service=ps)},
     )
-    assert run(p.run(module="maybe")) == ["missing"]
+    assert run(p.run(stage="maybe")) == ["missing"]
     assert svc.fetch("Maybe/maybe", str) == "missing"

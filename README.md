@@ -58,7 +58,7 @@ pipeline = Pipeline(
     },
 )
 
-asyncio.run(pipeline.run(module="all"))
+asyncio.run(pipeline.run(stage="all"))
 ```
 
 This writes `output/orders/run-1/Extract/build_order.json` and
@@ -72,7 +72,9 @@ the persisted `Order` and passes it into `summary`.
   the default disk backend: `str` → `.txt`, everything else → `.json`). No return
   annotation ⇒ nothing is persisted.
 - **`depends(producer)`** wires a parameter to another step's persisted output — same
-  stage (a scheduling edge) or another stage (a disk input from an earlier stage).
+  stage (a scheduling edge) or another stage (a disk input from an earlier stage). A step
+  *name* works too, resolved at class creation, for a producer defined further down the
+  class body (see [Loops](#loops)).
 - **`optional_depends(producer)`** is `depends` typed `R | None`: if the producer's value
   isn't persisted when this step runs, the parameter is None instead of the run raising.
   Scheduling is unchanged — a same-stage producer is still waited for and, if it *fails*,
@@ -81,10 +83,142 @@ the persisted `Order` and passes it into `summary`.
   is derived from `depends()` and validated at class creation (an unknown target or a
   cycle raises).
 - **`Pipeline`** namespaces persistence by `output_root/name` (plus `/run_id` when given) and runs its
-  stages. `run(module="all")` runs everything; `module=<stage>` runs one stage,
-  `module=<stage>, step=<step>` runs one step. `run` returns the last thing it ran — a
-  single step's value, or the final stage's step results — so callers can read the final
-  output without going back to the `PersistService`.
+  stages. `run(stage="all")` runs everything; `stage=<name>` runs one stage,
+  `stage=<name>, step=<step>` runs one step, and adding `follow_edges=True` enters an
+  edge-driven stage's graph at that step and keeps going (see [Loops](#loops)). `run`
+  returns the last thing it ran — a single step's value, or the final stage's step
+  results — so callers can read the final output without going back to the
+  `PersistService`.
+
+## Loops
+
+A stage has two ways to order itself, and picks exactly one:
+
+- **No `edges`** — `depends()` is the order. The DAG runs independent steps concurrently.
+  This is everything above, unchanged.
+- **`edges = (...)`** — you declare the whole graph and it runs sequentially, from
+  `START` until an edge reaches `EXIT`. Nothing is inferred.
+
+The second is how a stage expresses a loop, since `depends()` is dataflow and can't
+express a cycle or a branch:
+
+```python
+from stepper import EXIT, START, Stage, depends, edge, optional_depends, step
+
+
+class ChallengeStage(Stage):
+    @step
+    async def edit(self, prev: Analysis | None = optional_depends("analysis")) -> Draft: ...
+
+    @step
+    async def audit(self, draft=depends(edit)) -> AuditResult: ...
+
+    @step
+    async def analysis(self, draft=depends(edit)) -> Analysis: ...
+
+    steps = (edit, audit, analysis)
+
+    edges = (
+        edge(START).to(edit),
+        edge(edit).to(audit),
+        edge(audit).when(lambda r: r.passed).to(EXIT).otherwise(analysis),
+        edge(analysis)
+            .when(lambda r: r.rounds >= 8).to(EXIT)
+            .otherwise(edit),
+    )
+```
+
+Steps themselves don't change: inputs via `depends()`, one output model, no routing
+tokens in the return annotation. In an edge-driven stage `depends()` is *only* data
+wiring — it has no say in ordering. Declaring the edges *below* the steps is what makes
+the back edge legal: `analysis -> edit` is a forward reference at that point.
+
+- **`edge(source)`** is either unconditional (`.to(target)`) or a branch chain
+  (`.when(pred).to(target)`, closed by `.otherwise(target)`). First matching predicate
+  wins; `.otherwise` is required so exhaustiveness is structural.
+- **`edge(START).to(first)`** says where the graph begins — exactly one, unconditional
+  (there's no result to branch on yet).
+- **Predicates take the source's result** and must be pure functions of it — they're
+  re-evaluated on resume, so no clock, no randomness, no network. It's typed: `edge(audit)`
+  is an `Edge[AuditResult]`, so `r.passd` is a type error in your editor, not a surprise at
+  run time. The predicate is only ever *called* — nothing reads a return type to pick a
+  route.
+- **A branch sees its source's output and nothing else.** The step that just ran is the
+  thing reporting what happened, so whatever a decision needs belongs in its output model —
+  which also makes the persisted artifact a complete account of the state at that point. A
+  step needing a fact it doesn't own declares a `depends()` for it like any other input.
+- **`max_steps`** (a `Stage` ClassVar, default 1000) is a runaway fuse: routing to `EXIT`
+  is how a graph ends, and blowing the fuse raises. Set it well above any real run.
+
+**Declare the whole graph.** Every step in `steps` must have an edge out, be reachable
+from `START`, and be able to reach `EXIT` — all checked when the class is created, along
+with unknown targets, duplicate edges, and missing `.otherwise`. A step you forgot to wire
+is an error, not a step that silently never runs. The `EXIT` rule is per-step, not "there's
+an `EXIT` somewhere": a branch whose arm drops into a sub-cycle with no way out is as
+broken as a graph with no `EXIT` at all, it just takes a run to find out.
+
+**Inputs must line up with the graph**, and the bar differs by kind:
+
+- **Required** `depends()` — the producer must have run on *every* path from `START`.
+  Otherwise the fetch finds nothing stored and raises, every time. `edge(START).to(b)`
+  where `b = depends(a)` is rejected, as is a `join` reachable both through its producer
+  and around it.
+- **Optional** `optional_depends()` — the producer must be able to run before the consumer
+  on *at least one* path. `optional_depends` exists so a first pass can read None, not so
+  a parameter can be None forever; if nothing ever routes from producer to consumer, the
+  wiring is dead and gets rejected too.
+
+That asymmetry is what makes a back edge legal: in `START → b`, `b → a`, `a → b`, the
+second visit to `b` does have `a` behind it, so the optional read is meaningful even though
+the first one isn't.
+
+**The framework counts nothing.** There is no round number and no loop state. Real loops
+track several quantities at once — rounds, retries, budget raises — so one
+framework-owned counter would be a second source of truth about a loop that already
+records its own. Counters go in the step's output model, where they're typed, persisted,
+and readable on disk: `r.rounds` above is a field the step wrote.
+
+**Reading across the back edge.** `depends()`/`optional_depends()` also take a step
+*name*. The back edge's producer is defined below its consumer in the class body, so
+there's no object to pass yet — only a name, resolved when the class is created. A name
+carries no type, so annotate the parameter yourself (as `edit` does above).
+`optional_depends` is the usual choice: on the first pass the producer hasn't run, so the
+value reads back as None.
+
+**Persistence is unchanged.** A step writes `<Stage>/<step>` on every pass — it
+overwrites. So a `depends()` always reads the latest value, which is the right one either
+way: an upstream in the same pass has already written it, and a step reading across passes
+wants the previous pass's value, which is exactly what's there. Nothing accumulates, so
+there's no retention knob and no "which pass" question — including for
+`run(stage=, step=)`, which runs a single step against whatever is persisted, without
+advancing the graph.
+
+**Resume.** Progress is checkpointed to `<Stage>/_loop_cursor` after every step: the name
+of the next step, and nothing else. There's no state to save — every value a resumed run
+needs was persisted by the steps themselves, and any counter the graph routes on is a
+field they wrote. Re-running a crashed stage picks up at that step rather than at `START`.
+Writes are best-effort; a failed checkpoint never fails a pass. A cursor that's missing,
+corrupt, or pointing at a step the graph no longer has just restarts from `START` — but a
+backend that can't be read at all propagates, since silently restarting would repeat every
+side effect the run already made.
+
+**Entering anywhere.** Three ways to run an edge-driven stage, all through the one `run`:
+
+| call | what happens |
+|---|---|
+| `run(stage="challenge")` | from `START`, or from the cursor if a previous run crashed |
+| `run(stage="challenge", step="blind")` | that step alone, against what's persisted; cursor untouched |
+| `run(stage="challenge", step="blind", follow_edges=True)` | enter the graph at `blind` and follow edges to `EXIT` |
+
+`follow_edges` overrides a saved cursor — an explicit entry point wins over an automatic
+one — and checkpoints as it goes, so that run is itself resumable. It needs a stage that
+declares `edges`; a DAG has no single thread of control to drop into.
+
+> **Resume restores values, not side effects.** The step a run restarts at may have
+> already half-run, so it runs again in full — steps in an edge-driven stage must be
+> re-entrant. Anything the framework can't undo (a spawned job, a written workspace) is
+> yours to make safe. A resumed run also leaves mixed-generation state on disk: steps that
+> ran this pass hold current values, steps that didn't still hold the previous pass's.
 
 ## Persistence
 
@@ -178,14 +312,17 @@ you want into your hooks instance (e.g. `LogfireHooks(run_id=...)`).
 | `run_id` | `Pipeline(...)` | `None` | Optional per-run subdir under `output_root/name`, so separate runs don't clobber each other. Omit it and output lands directly in `output_root/name`. Ignored when you pass your own `persist_service`. |
 | `persist_service` | `Pipeline(...)` | disk backend under `output_root` | Swap in any `PersistService` (e.g. in-memory or object store); wins over `output_root`. |
 | `hooks` | `Pipeline(...)` / `Stage(...)` | `NoOpHooks()` | One `Hooks` or a list of them, wrapping each step and stage — add tracing/metrics/actions with no framework tracing dep. Several fan out: entered in order, exited in reverse. |
+| `edges` | `Stage` class body | `()` | Declare the stage's whole control-flow graph, `START` to `EXIT`, and it runs sequentially instead of as a `depends()` DAG. That's how a stage loops. |
+| `max_steps` | `Stage` class body | `1000` | Runaway fuse for an edge-driven stage: raises after this many step executions without reaching `EXIT`. |
 | `fail_fast` | `Pipeline(...)` / `run_steps(...)` | `False` | `True`: a stage cancels its in-flight steps and re-raises on the first step failure. Default: record it, skip its dependents, let independent branches finish. A single-step run always re-raises. |
 | `configure_logging(level=, fmt=)` | top-level fn | `INFO`, `"%(message)s"` | Optional stdlib logging setup so `[STEP_*]` / `[MODULE_*]` lines print. |
 
 ## Public API
 
-`Pipeline`, `StageFactory`, `Stage`, `Step`, `step`, `depends`, `optional_depends`, `Scheduler`,
-`PersistService`, `DiskPersistService`, `Persistable`, `Hooks`, `NoOpHooks`,
-`StepReport`, `configure_logging`.
+`Pipeline`, `StageFactory`, `Stage`, `Step`, `step`, `depends`, `optional_depends`,
+`edge`, `Edge`, `START`, `EXIT`, `Scheduler`,
+`PersistService`, `DiskPersistService`, `InMemoryPersistService`, `Persistable`, `Hooks`,
+`NoOpHooks`, `StepReport`, `configure_logging`.
 
 ## License
 

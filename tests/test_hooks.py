@@ -376,7 +376,7 @@ def test_pipeline_applies_hooks_to_all_stages(tmp_path, run):
             "b": lambda ps: BStage(persist_service=ps),
         },
     )
-    run(p.run(module="all"))
+    run(p.run(stage="all"))
     # every stage and step the pipeline ran is wrapped (order across concurrent steps
     # within a stage may interleave, so assert membership).
     for event in (
@@ -402,7 +402,7 @@ def test_pipeline_applies_a_list_of_hooks_to_all_stages(tmp_path, run):
             "b": lambda ps: BStage(persist_service=ps),
         },
     )
-    run(p.run(module="all"))
+    run(p.run(stage="all"))
     for event in (
         "A:stage-before:A", "B:stage-before:A", "A:stage-after:A", "B:stage-after:A",
         "A:step-before:prod", "B:step-before:prod", "A:step-after:prod", "B:step-after:prod",

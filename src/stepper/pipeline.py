@@ -45,7 +45,7 @@ class Pipeline:
             name: Pipeline name; the first path segment of the default output dir
                 (e.g. "orders" -> output/orders/...).
             stages: Maps stage name -> a factory that builds the stage from the shared
-                PersistService. Dict order is run order when you run `module="all"`.
+                PersistService. Dict order is run order when you run `stage="all"`.
             run_id: Optional per-run label. Adds a `/run_id` subdir so repeat runs don't
                 overwrite each other. Only the default disk backend uses it — a custom
                 `persist_service` sets its own run_id.
@@ -97,24 +97,42 @@ class Pipeline:
         stages just to read their step names; safe before a run does any work."""
         return {name: self.build_stage(name).get_steps() for name in self.stage_names()}
 
-    def _resolve_stage_names(self, module: str, step: str | None) -> tuple[str, ...]:
-        if module == "all":
+    def _resolve_stage_names(self, stage: str, step: str | None) -> tuple[str, ...]:
+        if stage == "all":
             if step:
-                raise ValueError("step is not valid with module 'all'")
+                raise ValueError("step is not valid with stage 'all'")
             return tuple(self.stage_names())
-        return (module,)
+        return (stage,)
 
-    async def run(self, *, module: str, step: str | None = None) -> Any:
-        """Run the whole pipeline (``module="all"``), one stage, or one step, and return
-        the last thing run — so a caller can read a pipeline's final output without going
-        back to the PersistService. A single-step run returns that step's value; a stage or
-        ``"all"`` run returns the final stage's step results (a list, in declaration order,
-        from `Stage.run_steps`)."""
+    async def run(
+        self, *, stage: str, step: str | None = None, follow_edges: bool = False
+    ) -> Any:
+        """Run the whole pipeline (``stage="all"``), one stage, or one step, and return the
+        last thing run — so a caller can read a pipeline's final output without going back
+        to the PersistService.
+
+        Args:
+            stage: A stage name, or ``"all"`` for every stage in declaration order.
+            step: Run just this step of `stage` instead of the whole thing, against
+                whatever is currently persisted. Not valid with ``"all"``.
+            follow_edges: Only with `step`, and only on a stage that declares `edges`.
+                Instead of running the step alone, *enter the graph* there and keep going
+                until an edge reaches `EXIT` — the manual counterpart to a crash resume.
+                The cursor is checkpointed as usual, so this run is itself resumable.
+
+        A single-step run returns that step's value; anything else returns the stage's step
+        results (a list, in declaration order, from `Stage.run_steps`).
+        """
+        if follow_edges and not step:
+            raise ValueError("follow_edges needs a step to start from.")
         result: Any = None
-        for name in self._resolve_stage_names(module, step):
-            stage = self.build_stage(name)
-            if step and name == module:
-                result = await stage.run_step(step)
+        for name in self._resolve_stage_names(stage, step):
+            built = self.build_stage(name)
+            if step and name == stage:
+                if follow_edges:
+                    result = await built.run_steps(fail_fast=self._fail_fast, start_at=step)
+                else:
+                    result = await built.run_step(step)
             else:
-                result = await stage.run_steps(fail_fast=self._fail_fast)
+                result = await built.run_steps(fail_fast=self._fail_fast)
         return result

@@ -10,10 +10,10 @@ nothing below a step, so any flow you can build is a flow you can run:
 Settings — the persist service, `run_id`, hooks — are given to the flow you run and
 inherited by everything beneath it. Constructing a flow constructs its subtree
 with it, so a flow instance is a whole run's tree. Values persist per step, keyed by the
-node's *path*, so mounting one flow twice gives two namespaces. Run order is derived from
-the `depends()` DAG, unless a flow declares `edges`: a full control-flow graph from `START`
-to `EXIT`, which is how it expresses a loop, checkpointing so a crashed run resumes
-mid-graph.
+node's *path*, so mounting one flow twice gives two namespaces. Run order is declared as
+`edges`: a full control-flow graph from `START` to `EXIT`, which is how a flow expresses a
+loop (checkpointing so a crashed run resumes mid-graph) and how it fans out — an edge with
+several targets runs them at once and carries on where their arms meet.
 """
 
 from stepper.edges import EXIT, START, Edge, edge

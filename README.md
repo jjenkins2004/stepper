@@ -24,6 +24,9 @@ above and no special case below.
   import.
 - **Loops that survive a crash.** A flow declares its control-flow graph, cycles included,
   checkpoints its way through, and resumes mid-loop where it died.
+- **Parallelism is one edge with several targets.** `edge(a).to(b, c, d)` runs all three at
+  once, `edge(b, c, d).to(m)` brings them back, and `m` is the node that reads every one of
+  them.
 
 Pure stdlib + pydantic — the framework depends on no tracing library. Add spans, metrics,
 or any before/after action yourself via `Hooks` (see below).
@@ -213,6 +216,9 @@ class ChallengeFlow(Flow[Analysis]):
 - **`edge(source)`** — unconditional `.to(target)`, or a branch chain
   `.when(pred).to(target)…` closed by `.otherwise(target)`. First matching predicate wins;
   `.otherwise` is required, so exhaustiveness is structural rather than hoped for.
+- **`.to(a, b, c)`** — several targets is a **fan-out**: they all run, concurrently, and
+  control resumes where their arms meet. **`edge(a, b, c).to(join)`** is the way back in:
+  one edge declared once per source, unconditional. See below.
 - **`edge(START).to(first)`** — where the graph begins. Exactly one, unconditional (there's
   no result to branch on yet). **`EXIT`** ends it.
 - **Sources and targets** may be steps or nested flows. A predicate on either gets that
@@ -221,8 +227,9 @@ class ChallengeFlow(Flow[Analysis]):
   They must be pure (resume re-evaluates them: no clock, no randomness, no network) and see
   their source's output alone. A decision needing another fact reads it via `depends()`, or
   the source puts it in its own output model.
-- **`max_steps`** (`Flow` ClassVar, default 1000) — runaway fuse; blowing it raises.
-  Reaching `EXIT` is how a graph is meant to end, so set this well above any real run.
+- **`max_steps`** (`Flow` ClassVar, default 1000) — runaway fuse; blowing it raises. One
+  budget for the whole graph, concurrent arms included. Reaching `EXIT` is how a graph is
+  meant to end, so set this well above any real run.
 
 Declaring `edges` *below* the steps is what makes a back edge legal, and `depends("name")`
 is how a step reads a producer declared below it (a name carries no type, so annotate the
@@ -231,12 +238,84 @@ parameter yourself, as `edit` does above).
 The framework tracks no round number and no loop state. Counters live in a step's own output
 model, where they're typed and persisted — `r.rounds` above is a field a step wrote.
 
+### Fan out, fan back in
+
+Give one `.to(...)` several targets and they all run, at the same time:
+
+```python
+class ListingFlow(Flow[Listing]):
+    @step
+    async def brief(self) -> Brief: ...
+
+    @step
+    async def images(self, b=depends(brief)) -> Images: ...
+    @step
+    async def copy(self, b=depends(brief)) -> Copy: ...
+    @step
+    async def pricing(self, b=depends(brief)) -> Pricing: ...
+
+    @step
+    async def assemble(self, i=depends(images), c=depends(copy), p=depends(pricing)) -> Listing: ...
+
+    edges = (
+        edge(START).to(brief),
+        edge(brief).to(images, copy, pricing),         # fans out
+        edge(images, copy, pricing).to(assemble),      # and back together
+        edge(assemble).to(EXIT),
+    )
+```
+
+Several *targets* fan out; several *sources* is the shorthand for coming back in, since
+that's three edges you'd write anyway. A multi-source edge routes unconditionally — its
+sources have no one result to branch on — and it's sugar and nothing else, so `edge(images)`
+elsewhere in the same tuple is the same "one edge per node" error it has always been.
+
+The node the arms meet at — `assemble` — is where the flow carries on, and it is the one
+node that may `depends()` on all of them: every arm ran, so every arm's output is behind it.
+You never name it. It's derived as the first node every arm is guaranteed to reach, which is
+what lets an arm branch, loop, or fan out again without changing how a fan-out is written:
+
+```python
+edge(check).when(lambda r: r.heavy).to(images, copy).otherwise(reuse)   # this branch fans out
+edge(images).to(crop, tag)                                              # and again, inside it
+```
+
+Arms are independent. They run concurrently, so a `depends()` from one arm into another is a
+race, not an ordering, and it's rejected — the join is where arms are read. Nothing may jump
+into the middle of an arm, and no arm may loop back to the node that fanned out; loop from
+the join instead. All of it is checked when the class is created.
+
+Arms whose only meeting point is `EXIT` are rejected too. A flow's value is whatever node it
+*ended* on, and several arms ending at once names no node — so `edge(a).to(b, c)` with `b`
+and `c` both routing to `EXIT` is a declaration error, not a coin flip. Add the node that
+reads them.
+
+A step is `async`, so an arm that's pure CPU blocks the others; hand that to a thread or a
+process yourself, as you would anywhere else. Hooks see arms concurrently — several `step()`
+context managers open at once, closing in whatever order the arms finish.
+
 ### Checked when the class is created
 
 Every node must have an edge out, be reachable from `START`, and be able to reach `EXIT`.
 That last one is per-node, not "there's an `EXIT` somewhere": a branch arm that drops into
-an inescapable sub-cycle is rejected. Plus exactly one unconditional `edge(START)`, no
-duplicate edges, `.otherwise` on every branch, and targets that are nodes of this flow.
+an inescapable sub-cycle is rejected. Plus exactly one unconditional single-target
+`edge(START)`, no node named by two `edge(...)`s, `.otherwise` on every branch, and targets
+that are nodes of this flow. A multi-source edge is unconditional and single-target: it fans
+in, so it can't also branch or fan out.
+
+Every fan-out must have somewhere its arms meet, and that place must be a node rather than
+`EXIT`. Its arms must be disjoint, and none of them may route back to the node that fanned
+out. Above all, an arm is entered *only* by the fan-out taking it — nothing else routes into
+one, the graph doesn't begin inside one, and the source itself may not reach one by another
+branch. That last rule is the subtle one, and it's what the join's `depends()` rests on:
+
+```python
+edge(check).when(...).to(extra, common).otherwise(common)   # rejected
+```
+
+`common` runs either way, so it reads as safe — but on the `.otherwise` route it runs
+*alone*, and a join that depends on `extra` would find nothing. Give the other branch its
+own node.
 
 Dependencies are checked against the graph too:
 
@@ -244,7 +323,11 @@ Dependencies are checked against the graph too:
 |---|---|
 | `depends()` | on **every** path from `START` — else the fetch finds nothing, every time |
 | `optional_depends()` | on **at least one** path — else it's None forever and the wiring is dead |
+| across two arms of a fan-out | never — they run at once, so it's a race; read them at the join |
 | a producer that persists nothing | exempt — there's no fetch to fail |
+
+A fan-out's join is the exception to "every path": all of its arms ran, so everything they
+produced counts as available there, which is what makes `assemble` above legal.
 
 That split is what makes a back edge legal: in `START → b`, `b → a`, `a → b`, the second
 visit to `b` has `a` behind it even though the first doesn't.
@@ -261,7 +344,9 @@ either way, since an upstream in the same pass has already written it and a cros
 wants the previous one. Nothing accumulates: no retention knob, no "which pass" question.
 
 Progress is checkpointed to `<flow path>/_loop_cursor` — the next node's name, nothing else
-— so a crashed run resumes there instead of at `START`. Checkpoint writes are best-effort. A
+— so a crashed run resumes there instead of at `START`. A fan-out has no single "next", so
+while its arms are in flight the cursor names the node that fanned out: a crash there
+resumes by re-running it and every arm. Checkpoint writes are best-effort. A
 cursor that's missing, corrupt, or naming a node the graph no longer has restarts from
 `START`; a backend that can't be read *at all* propagates, since restarting silently would
 repeat side effects.
@@ -376,7 +461,7 @@ Exactly when each runs:
 | `persist_service` | `run(...)` / `mount(...)` | `DiskPersistService(base_dir="output")` | The backend, which owns where output physically lands. |
 | `hooks` | `run(...)` / `mount(...)` | `()` | One `Hooks` or a list of them, wrapping every node in the tree. Several fan out: entered in order, exited in reverse. |
 | `edges` | `Flow` class body | — | Required. The flow's whole control-flow graph, `START` to `EXIT`. |
-| `max_steps` | `Flow` class body | `1000` | Runaway fuse: raises after this many node executions without reaching `EXIT`. |
+| `max_steps` | `Flow` class body | `1000` | Runaway fuse: raises after this many node executions without reaching `EXIT`. One budget for the whole graph, concurrent arms included. |
 | `configure_logging(level=, fmt=)` | top-level fn | `INFO`, `"%(message)s"` | Optional stdlib logging setup so `[STEP_*]` / `[MODULE_*]` lines print. |
 
 ## Public API

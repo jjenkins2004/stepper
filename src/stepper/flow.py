@@ -52,10 +52,11 @@ so its inputs persist too.
 there.
 
 **Order is always declared.** Every flow spells out its graph, `START` to `EXIT`, and runs
-it sequentially: run a node, ask its edge where to go, repeat. Targets may be steps *or*
-nested flows, a predicate on either gets its typed output, and a cycle is how a flow loops.
-Nothing is inferred from `depends()` — that is dataflow, and it is checked against the
-graph rather than defining it.
+it: run a node, ask its edge where to go, repeat. Targets may be steps *or* nested flows, a
+predicate on either gets its typed output, a cycle is how a flow loops, and an edge with
+several targets is how it fans out — those arms run at once and meet at one node. Nothing
+is inferred from `depends()` — that is dataflow, and it is checked against the graph rather
+than defining it.
 
 **The output is whatever finishes.** The nodes with an edge to `EXIT` are the flow's
 terminals; the one a run actually ends on supplies its value, persisted under the flow's own
@@ -69,8 +70,9 @@ a surprise mid-run.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Coroutine, Iterable, Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from time import perf_counter
@@ -137,6 +139,40 @@ def _declared_output(cls: "type[Flow[Any]]") -> Any:
             if args and isinstance(args[0], type):
                 return args[0]
     return None
+
+
+class _Budget:
+    """`max_steps` while a graph runs. One counter shared by every concurrent arm, because
+    the fuse is about the whole flow: a runaway predicate inside one arm is a runaway run.
+    Never exposed to a predicate — it is not a round number."""
+
+    __slots__ = ("left", "limit")
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.left = limit
+
+    def spend(self, path: str) -> None:
+        if self.left <= 0:
+            raise RuntimeError(
+                f"{path}: ran {self.limit} nodes without reaching EXIT "
+                f"(max_steps is a runaway fuse — a predicate is probably wrong)."
+            )
+        self.left -= 1
+
+
+async def _run_arms(walks: Iterable[Coroutine[Any, Any, Any]]) -> None:
+    """Run a fan-out's arms concurrently. The first failure cancels its siblings and
+    propagates as itself, so a step's exception reaches the caller exactly as it does in a
+    sequential flow — no wrapper type, no partial run left in flight."""
+    tasks = [asyncio.ensure_future(w) for w in walks]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 def _normalize_hooks(hooks: Hooks | Sequence[Hooks] | None) -> tuple[Hooks, ...]:
@@ -499,6 +535,16 @@ class Flow(Node, Generic[R]):
             return None
         if cursor.next not in self._bound_nodes:
             return None      # graph was edited since the checkpoint — start clean
+        if type(self).plan().graph.inside_a_fan_out(cursor.next):
+            # Only an explicit `run(target, follow_edges=True)` can leave a cursor inside a
+            # fan-out's arms. Resuming there would run that arm alone, with its siblings
+            # never started and the join reading whatever an earlier pass left — so treat it
+            # like any other cursor the graph can't honour and start clean.
+            _LOGGER.warning(
+                "%s: the saved cursor points inside a fan-out (%s); starting from START.",
+                self.path, cursor.next,
+            )
+            return None
         return cursor
 
     def _save_cursor(self, cursor: _Cursor) -> None:
@@ -510,13 +556,7 @@ class Flow(Node, Generic[R]):
             _LOGGER.warning("%s: could not checkpoint the graph cursor.", self.path)
 
     async def _run_graph(self, start_at: str | None = None) -> Any:
-        """Run the declared graph to completion and return this flow's output value (or,
-        with no `output`, the last value of each node this call ran, in declaration order).
-
-        Sequential by construction: run a node, ask its edge where to go, checkpoint, go.
-        The only number tracked is `executed`, and it is never exposed — it's the fuse that
-        stops a wrong predicate from spinning forever, not a round counter. Anything the
-        graph routes on is a field the steps themselves wrote.
+        """Run the declared graph to completion and return this flow's output value.
 
         `start_at` enters the graph at a chosen node, overriding both the saved cursor and
         the entry — the manual counterpart to a crash resume. It runs against whatever is
@@ -524,16 +564,13 @@ class Flow(Node, Generic[R]):
         anywhere else.
         """
         plan = type(self).plan()
-        graph = plan.graph
         cursor = None if start_at is not None else self._load_cursor()
         if start_at is not None:
             node = start_at
         elif cursor is not None and cursor.next is not None:
             node = cursor.next
         else:
-            node = graph.entry
-        results: dict[str, Any] = {}
-        executed = 0
+            node = plan.graph.entry
 
         if start_at is not None:
             _LOGGER.info("%s: entering the graph at %s.", self.path, node)
@@ -544,22 +581,49 @@ class Flow(Node, Generic[R]):
         elif cursor is not None:
             _LOGGER.info("%s: resuming at %s.", self.path, node)
 
+        return self._finish(await self._walk(node, None, _Budget(plan.max_steps), top=True))
+
+    async def _walk(self, node: str, stop: str | None, budget: _Budget, *, top: bool) -> Any:
+        """Follow edges from `node` until `stop` (or `EXIT`, when there is none), and return
+        the value of the last node it ran.
+
+        Run a node, ask its edge where to go, go. A fan-out is the one place that isn't a
+        single step forward: its arms are the same walk again, one per arm, run concurrently
+        and each stopping at the join. They are independent sub-graphs — disjoint, and
+        enterable only through the fan-out — which is checked when the flow is declared, so
+        two arms never touch the same node and the join runs exactly once, here, after they
+        have all finished.
+
+        Only the top-level walk checkpoints. An arm has no cursor of its own: the flow's
+        position while a region is in flight is "inside the fan-out at X", which the cursor
+        records as X itself. A crash there resumes by re-running X and every arm — the same
+        re-entrancy the resume contract already asks for, just wider.
+        """
+        graph = type(self).plan().graph
         while True:
-            executed += 1
-            if executed > plan.max_steps:
-                raise RuntimeError(
-                    f"{self.path}: ran {plan.max_steps} nodes without reaching EXIT "
-                    f"(max_steps is a runaway fuse — a predicate is probably wrong)."
+            budget.spend(self.path)
+            value = await self._bound_nodes[node].run()
+
+            route = graph.route(node, value)
+            if route.fan is not None:
+                if top:
+                    self._save_cursor(_Cursor(next=node))
+                await _run_arms(
+                    self._walk(arm, route.fan.join, budget, top=False) for arm in route.fan.arms
                 )
-            results[node] = await self._bound_nodes[node].run()
+                nxt: str | None = route.fan.join
+            else:
+                nxt = route.target
 
-            target = graph.target_name(graph.edge_for(node).resolve(results[node]))
-            if target is None:                       # EXIT
+            if nxt is None:                          # EXIT — only ever reached at the top
                 self._save_cursor(_Cursor(next=None, done=True))
-                return self._finish(results[node])
+                return value
+            if nxt == stop:                          # this arm has arrived at the join
+                return value
 
-            node = target
-            self._save_cursor(_Cursor(next=node))
+            node = nxt
+            if top:
+                self._save_cursor(_Cursor(next=node))
 
     # --- running ----------------------------------------------------------------------
 

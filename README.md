@@ -1,24 +1,32 @@
 # stepper
 
-A tiny pipeline framework. Declare steps with `@step`, wire their inputs with `depends`,
-group them into a `Stage`, run a `Pipeline`. Run order comes from the wiring, every step's
-return value is persisted, and a stage can loop.
+A tiny pipeline framework built on one idea: **a flow is a step made of steps.**
+
+A step is an async function with declared inputs and one typed output. A flow is the same
+shape — declared inputs, one typed output — except its output comes from the nodes inside
+it, which are steps or other flows. That's the whole structure. There is no pipeline layer
+above and no special case below.
 
 **Why it's useful**
 
-- **Order you never maintain.** `depends()` says what a step *reads*; run order and
-  concurrency fall out of it. Insert or reorder a step and nothing else changes — and an
-  unknown target or a cycle raises when the class is created, not mid-run.
-- **Every step's output is on disk.** Read a run's output dir to see what happened, re-run
-  one step against what's already there, or feed a later stage from an earlier one. Debug
-  by inspection instead of by re-running the world.
-- **Wiring is typed.** `depends(build_order)` gives the consuming parameter the producer's
-  return type, so a mismatch is an editor error.
-- **Loops that survive a crash.** A stage can declare a control-flow graph with cycles and
-  branches, checkpoint its way through, and resume mid-loop where it died.
+- **Nothing reaches into anything.** A step reads its own flow's steps, its own flow's
+  children, or one of its flow's declared inputs. Nothing else is in scope, so wiring never
+  crosses a flow boundary and nothing is ever resolved by name, proximity, or guesswork.
+- **A flow is reusable because it's a function.** Declare what it needs with `require()`,
+  bind that where you mount it, and mount it as many times as you like. Two mounts are two
+  namespaces on disk, differing because they were called with different arguments.
+- **Every value is on disk, at a path you can predict.** A node's path is the chain of
+  names from the root down, and that path *is* its persist key. Read a run's output
+  directory to see exactly what happened.
+- **Errors happen when you write the class, not when you run it.** A flow's declaration is
+  entirely about itself, so unbound inputs, mistyped bindings, unreachable nodes, a branch
+  that can't finish, and a `depends()` that isn't guaranteed to have run all raise at
+  import.
+- **Loops that survive a crash.** A flow declares its control-flow graph, cycles included,
+  checkpoints its way through, and resumes mid-loop where it died.
 
-Pure stdlib + pydantic — the framework depends on no tracing library. Add spans,
-metrics, or any before/after action yourself via `Hooks` (see below).
+Pure stdlib + pydantic — the framework depends on no tracing library. Add spans, metrics,
+or any before/after action yourself via `Hooks` (see below).
 
 > Name note: the `stepper` name on PyPI belongs to an unrelated stepper-motor library.
 > Install this straight from git (below); it is never published to PyPI.
@@ -36,90 +44,151 @@ import asyncio
 
 from pydantic import BaseModel
 
-from stepper import Pipeline, Stage, depends, step
+from stepper import EXIT, START, Flow, depends, edge, require, step
 
 
 class Order(BaseModel):
     total: int
 
 
-class ExtractStage(Stage):
+class TaxFlow(Flow[Order]):
+    order = require(Order)                      # what this flow needs
+
     @step
-    async def build_order(self) -> Order:
+    async def with_tax(self, o=depends(order)) -> Order:
+        return Order(total=int(o.total * 1.2))
+
+    edges = (edge(START).to(with_tax), edge(with_tax).to(EXIT))
+
+
+class CheckoutFlow(Flow[str]):
+    @step
+    async def build(self) -> Order:
         return Order(total=100)
 
-    steps = (build_order,)
+    taxed = TaxFlow.bind(order=build)           # mounting it is the call
 
-
-class ReportStage(Stage):
     @step
-    async def summary(self, order=depends(ExtractStage.build_order)) -> str:
-        return f"order total: {order.total}"
+    async def summary(self, o=depends(taxed)) -> str:
+        return f"order total: {o.total}"
 
-    steps = (summary,)
+    edges = (
+        edge(START).to(build),
+        edge(build).to(taxed),
+        edge(taxed).to(summary),
+        edge(summary).to(EXIT),
+    )
 
 
-pipeline = Pipeline(
-    name="orders",
-    run_id="run-1",
-    output_root="output",  # writes output/orders/run-1/<Stage>/<step>.{json,txt}
-    stages={
-        "extract": lambda ps: ExtractStage(persist_service=ps),
-        "report": lambda ps: ReportStage(persist_service=ps),
-    },
-)
-
-asyncio.run(pipeline.run(stage="all"))
+asyncio.run(CheckoutFlow().run(run_id="run-1"))
 ```
 
-This writes `output/orders/run-1/Extract/build_order.json` and
-`output/orders/run-1/Report/summary.txt`. `depends(ExtractStage.build_order)` fetches
-the persisted `Order` and passes it into `summary`.
+Returns `"order total: 120"` and writes:
+
+```
+output/run-1/checkout.txt                     the root's own value
+output/run-1/checkout/build.json              Order(total=100)
+output/run-1/checkout/taxed/with_tax.json     Order(total=120)
+output/run-1/checkout/taxed.json              the nested flow's value
+output/run-1/checkout/summary.txt             "order total: 120"
+output/run-1/checkout/_loop_cursor.json       where each graph got to
+output/run-1/checkout/taxed/_loop_cursor.json
+```
+
+Every node's path is its key: `checkout/taxed/with_tax` is the step, `checkout/taxed` is the
+flow it lives in, and both are on disk.
 
 ## Core concepts
 
-- **`@step`** turns an async `Stage` method into a step. Its return annotation is the
-  model persisted/fetched for it — a `Persistable` also stores its own side-artifacts (on
-  the default disk backend: `str` → `.txt`, everything else → `.json`). No return
-  annotation ⇒ nothing is persisted.
-- **`depends(producer)`** wires a parameter to another step's persisted output — same
-  stage (a scheduling edge) or another stage (a disk input from an earlier stage). A step
-  *name* works too, resolved at class creation, for a producer defined further down the
-  class body (see [Loops](#loops)). A producer that persists nothing is pure ordering: the
-  consumer still runs after it, and the parameter is `None` — typed that way, since such a
-  step is a `Step[None]`.
-- **`optional_depends(producer)`** is `depends` typed `R | None`: if the producer's value
-  isn't persisted when this step runs, the parameter is None instead of the run raising.
-  Scheduling is unchanged — a same-stage producer is still waited for and, if it *fails*,
-  this step is still skipped; only a *missing* persisted value becomes None.
-- **`Stage`** lists its steps in `steps = (...)` — membership, *not* order. Run order
-  is derived from `depends()` and validated at class creation (an unknown target or a
-  cycle raises).
-- **`Pipeline`** namespaces persistence by `output_root/name` (plus `/run_id` when given) and runs its
-  stages. `run(stage="all")` runs everything; `stage=<name>` runs one stage,
-  `stage=<name>, step=<step>` runs one step, and adding `follow_edges=True` enters an
-  edge-driven stage's graph at that step and keeps going (see [Loops](#loops)). `run`
-  returns the last thing it ran — a single step's value, or the final stage's step
-  results — so callers can read the final output without going back to the
-  `PersistService`.
+### Producers
 
-## Loops
+Three things have an output, and `depends()` takes any of them — a step consuming one
+can't tell which it got:
 
-A stage orders itself one of two ways, never both:
+| | what it is |
+|---|---|
+| `@step` | an output it computes itself |
+| `SomeFlow.bind(...)` | an output its subtree computes |
+| `require(Model)` | an output with no producer, supplied by whoever mounts this flow |
 
-- **No `edges`** — `depends()` is the order; independent steps run concurrently. Everything
-  above, unchanged.
-- **`edges = (...)`** — you declare the whole graph and it runs sequentially, `START` to
-  `EXIT`. Nothing is inferred.
+All three are **class attributes**, and that isn't stylistic: a `depends()` is a parameter
+default, evaluated while the class body runs. There is no `self` at that moment and never
+will be, so anything a step reads has to already be an attribute. That's also what confines
+wiring to one class — every `depends()` names something declared right there.
 
-The second is how a stage loops, since `depends()` is dataflow and can't express a cycle
-or a branch:
+### `require()` and `.bind()`
+
+A flow is a function. `require()` declares its parameters, `Flow[Model]` declares its
+return type, and mounting it is the call:
 
 ```python
-from stepper import EXIT, START, Stage, depends, edge, optional_depends, step
+class ChannelFlow(Flow[Receipt]):
+    product = require(Product)
+    channel = require(Channel)
+    ...
 
+tiktok = ChannelFlow.bind(product=normalize, channel=tiktok_spec)
+shein  = ChannelFlow.bind(product=normalize, channel=shein_spec)
+```
 
-class ChallengeStage(Stage):
+Each keyword is one of the child's requirements; each value is a producer declared on the
+mounting class. Both are checked when that class is created.
+
+Two mounts of one class collide with nothing, because a binding names both ends. There is
+no resolution step to get wrong: `push/tiktok/upload` and `push/shein/upload` are different
+keys because they're different nodes.
+
+**Closed and open.** A flow with no requirements is *closed* — it runs on its own,
+anywhere. One with requirements is *open*: it runs wherever they're supplied. To run an open
+flow by itself, write a small closed flow that supplies them. The harness is a flow like any
+other, so its inputs persist and the standalone run is as inspectable as a real one.
+
+```python
+class TiktokOnlyFlow(Flow[Receipt]):
+    @step
+    async def product(self) -> Product: ...
+    @step
+    async def channel(self) -> Channel: ...
+
+    only = ChannelFlow.bind(product=product, channel=channel)
+
+    edges = (edge(START).to(product), edge(product).to(channel),
+             edge(channel).to(only), edge(only).to(EXIT))
+```
+
+### `output`
+
+A flow's value is whatever node it *ended* on. The nodes with an edge to `EXIT` are its
+terminals, and they all have to produce the same model — `Flow[Receipt]` is the contract,
+checked against them when the class is created.
+
+The flow persists that value under its own path, so `depends(some_flow)` reads a key like
+any other, and a finished subtree leaves one artifact naming it.
+
+### Paths
+
+A node's path is the `/`-joined chain of names from the root down, root included — the
+attribute name each node was declared under, all the way up. It is also the key it persists
+under. `run_id` prefixes *keys* rather than paths, so two runs never collide on the backend
+while an address means the same thing in every run.
+
+```python
+await root.run()                        # everything
+await root.run("tiktok")                # that subtree
+await root.run("tiktok/upload/attempt") # one step, against what's persisted
+```
+
+Each node eats the first segment and hands the rest down, so `run("tiktok/upload/attempt")`
+is `tiktok` asking `upload` to run `attempt`.
+
+## Order
+
+Every flow declares its whole graph, `START` to `EXIT`, and runs it sequentially: run a
+node, ask its edge where to go, repeat. Nothing is inferred — `depends()` is dataflow, and
+it's checked *against* the graph rather than defining it.
+
+```python
+class ChallengeFlow(Flow[Analysis]):
     @step
     async def edit(self, prev: Analysis | None = optional_depends("analysis")) -> Draft: ...
 
@@ -128,8 +197,6 @@ class ChallengeStage(Stage):
 
     @step
     async def analysis(self, draft=depends(edit)) -> Analysis: ...
-
-    steps = (edit, audit, analysis)
 
     edges = (
         edge(START).to(edit),
@@ -148,30 +215,28 @@ class ChallengeStage(Stage):
   `.otherwise` is required, so exhaustiveness is structural rather than hoped for.
 - **`edge(START).to(first)`** — where the graph begins. Exactly one, unconditional (there's
   no result to branch on yet). **`EXIT`** ends it.
-- **Predicates** take the source step's result and return a bool. Typed — `edge(audit)` is
-  an `Edge[AuditResult]`, so `r.passd` is an editor error — and only ever *called*: nothing
-  reads a return type to pick a route. They must be pure (resume re-evaluates them: no
-  clock, no randomness, no network) and they see their source's output alone. A decision
-  needing another step's fact declares a `depends()` for it, or the source puts it in its
-  own output model.
-- **`max_steps`** (`Stage` ClassVar, default 1000) — runaway fuse; blowing it raises.
+- **Sources and targets** may be steps or nested flows. A predicate on either gets that
+  node's typed output — `edge(audit)` is an `Edge[AuditResult]`, so `r.passd` is an editor
+  error. Predicates are only ever *called*: nothing reads a return type to pick a route.
+  They must be pure (resume re-evaluates them: no clock, no randomness, no network) and see
+  their source's output alone. A decision needing another fact reads it via `depends()`, or
+  the source puts it in its own output model.
+- **`max_steps`** (`Flow` ClassVar, default 1000) — runaway fuse; blowing it raises.
   Reaching `EXIT` is how a graph is meant to end, so set this well above any real run.
 
-Steps don't change: inputs via `depends()`, one output model, no routing tokens in the
-return annotation. In an edge-driven stage `depends()` is data wiring only — the edges own
-ordering. Declaring `edges` *below* the steps is what makes the back edge legal, and
-`depends("name")` is how a step reads a producer defined below it (a name carries no type,
-so annotate the parameter yourself, as `edit` does above).
+Declaring `edges` *below* the steps is what makes a back edge legal, and `depends("name")`
+is how a step reads a producer declared below it (a name carries no type, so annotate the
+parameter yourself, as `edit` does above).
 
-The framework tracks no round number and no loop state. Counters live in the step's own
-output model, where they're typed and persisted — `r.rounds` above is a field a step wrote.
+The framework tracks no round number and no loop state. Counters live in a step's own output
+model, where they're typed and persisted — `r.rounds` above is a field a step wrote.
 
-### Checked at class creation
+### Checked when the class is created
 
-Every step must have an edge out, be reachable from `START`, and be able to reach `EXIT`.
-That last one is per-step, not "there's an `EXIT` somewhere": a branch arm that drops into
+Every node must have an edge out, be reachable from `START`, and be able to reach `EXIT`.
+That last one is per-node, not "there's an `EXIT` somewhere": a branch arm that drops into
 an inescapable sub-cycle is rejected. Plus exactly one unconditional `edge(START)`, no
-duplicate edges, `.otherwise` on every branch, and targets that are listed steps.
+duplicate edges, `.otherwise` on every branch, and targets that are nodes of this flow.
 
 Dependencies are checked against the graph too:
 
@@ -179,145 +244,149 @@ Dependencies are checked against the graph too:
 |---|---|
 | `depends()` | on **every** path from `START` — else the fetch finds nothing, every time |
 | `optional_depends()` | on **at least one** path — else it's None forever and the wiring is dead |
-| producer that persists nothing | exempt — there's no fetch to fail |
+| a producer that persists nothing | exempt — there's no fetch to fail |
 
 That split is what makes a back edge legal: in `START → b`, `b → a`, `a → b`, the second
 visit to `b` has `a` behind it even though the first doesn't.
 
+And, on top of the graph: a `depends()` on another flow's node, a binding to a producer
+declared elsewhere, a binding whose model doesn't match the `require()`, an unbound
+requirement, a name bound to two producers, and terminals that disagree about what the flow
+produces.
+
 ### Passes and resume
 
-A step overwrites `<Stage>/<step>` on every pass, so `depends()` always reads the latest —
-right either way, since an upstream in the same pass has already written it and a
-cross-pass read wants the previous one. Nothing accumulates: no retention knob, no "which
-pass" question.
+A node overwrites its key on every pass, so `depends()` always reads the latest — right
+either way, since an upstream in the same pass has already written it and a cross-pass read
+wants the previous one. Nothing accumulates: no retention knob, no "which pass" question.
 
-Progress is checkpointed to `<Stage>/_loop_cursor` — the next step's name, nothing else —
-so a crashed run resumes there instead of at `START`. Checkpoint writes are best-effort. A
-cursor that's missing, corrupt, or naming a step the graph no longer has restarts from
+Progress is checkpointed to `<flow path>/_loop_cursor` — the next node's name, nothing else
+— so a crashed run resumes there instead of at `START`. Checkpoint writes are best-effort. A
+cursor that's missing, corrupt, or naming a node the graph no longer has restarts from
 `START`; a backend that can't be read *at all* propagates, since restarting silently would
 repeat side effects.
 
-Three ways to run an edge-driven stage, all through the one `run`:
+Three ways to run, all through the one `run`:
 
 | call | what happens |
 |---|---|
-| `run(stage="challenge")` | from `START`, or from the cursor if a previous run crashed |
-| `run(stage="challenge", step="blind")` | that step alone, against what's persisted; cursor untouched |
-| `run(stage="challenge", step="blind", follow_edges=True)` | enter the graph at `blind` and follow edges to `EXIT` |
+| `run()` | from `START`, or from the cursor if a previous run crashed |
+| `run("upload/attempt")` | that node alone, against what's persisted; cursor untouched |
+| `run("upload/attempt", follow_edges=True)` | enter `upload`'s graph at `attempt` and follow edges to `EXIT` |
 
 `follow_edges` overrides a saved cursor — an explicit entry beats an automatic one — and
-checkpoints as it goes, so that run is itself resumable. It needs a stage that declares
-`edges`; a DAG has no single thread of control to drop into.
+checkpoints as it goes, so that run is itself resumable.
 
-> **Resume restores values, not side effects.** The step a run restarts at may have
-> already half-run, so it runs again in full — steps in an edge-driven stage must be
-> re-entrant. Anything the framework can't undo (a spawned job, a written workspace) is
-> yours to make safe. A resumed run also leaves mixed-generation state on disk: steps that
-> ran this pass hold current values, steps that didn't still hold the previous pass's.
+> **Resume restores values, not side effects.** The node a run restarts at may have already
+> half-run, so it runs again in full — nodes must be re-entrant. Anything the framework
+> can't undo (a spawned job, a written workspace) is yours to make safe. A resumed run also
+> leaves mixed-generation state on disk: nodes that ran this pass hold current values, nodes
+> that didn't still hold the previous pass's. The same applies to re-running a finished flow
+> without a fresh `run_id` — it starts at `START`, but against whatever the last run left.
 
 ## Persistence
 
-`persist(key, value, model)` / `fetch(key, model)` store and reload a step's value through
-the backend, which owns how it's encoded and where it lands — the only contract is that the
+`persist(key, value, model)` / `fetch(key, model)` store and reload a value through the
+backend, which owns how it's encoded and where it lands — the only contract is that the
 value round-trips. The default `DiskPersistService` writes one file per key: a `str` as
 `.txt`, raw `bytes` under the key verbatim, anything else as `.json` (round-trips
 int/list/BaseModel/etc.). `InMemoryPersistService` is the same encoding into a dict instead
-of files — no disk at all, for a single run whose output must not be written anywhere (pass
-it as `persist_service=`). A value can also be a `Persistable` — a model that runs its own
-persistence on top.
+of files — no disk at all, for a run whose output must not be written anywhere.
 
-A `Persistable` is a `BaseModel` that hooks into the persist/fetch lifecycle. Its plain
-fields still serialize as JSON metadata; on top of that, `on_persist`/`on_fetch` let the
-model persist and reload anything else it owns (large blobs, derived artifacts, external
-references) by calling `persist`/`fetch` again with its own keys — usually `bytes` under a
-sub-key like `f"{key}/image.png"`. The key is opaque, so bake any backend naming (a file
-extension, a bucket path) into it. `persist` writes the fields, then calls
-`on_persist(service, key)`; `fetch` rebuilds the model, then calls `on_fetch(service, key)`
-so it can stash the service+key and lazy-load later. Keep the extra state in `PrivateAttr`
-so the metadata dump skips it. Consumers that need images (and PIL) build their own
-`Persistable` — stepper stays pydantic-only.
+`base_dir` is the backend's business, not a flow's; a run's separation comes from the
+`run_id` the root bakes into every key.
+
+A value can also be a `Persistable` — a `BaseModel` that hooks into the persist/fetch
+lifecycle. Its plain fields still serialize as JSON metadata; on top of that,
+`on_persist`/`on_fetch` let the model persist and reload anything else it owns (large blobs,
+derived artifacts, external references) by calling `persist`/`fetch` again with its own keys
+— usually `bytes` under a sub-key like `f"{key}/image.png"`. The key is opaque, so bake any
+backend naming (a file extension, a bucket path) into it. `persist` writes the fields, then
+calls `on_persist(service, key)`; `fetch` rebuilds the model, then calls `on_fetch(service,
+key)` so it can stash the service+key and lazy-load later. Keep the extra state in
+`PrivateAttr` so the metadata dump skips it. Consumers that need images (and PIL) build
+their own `Persistable` — stepper stays pydantic-only.
 
 ## Telemetry / hooks
 
-The framework depends on no tracing library. To add spans, metrics, or any
-before/after action, pass a `Hooks` implementation to `Pipeline` (or a `Stage`). Each
-hook is a context manager wrapped around the work — code before `yield` runs before
-the step/stage, code after runs when it finishes or raises:
+The framework depends on no tracing library. To add spans, metrics, or any before/after
+action, pass a `Hooks` implementation to the flow you run. Each hook is a context manager
+wrapped around the work — code before `yield` runs before the node, code after runs when it
+finishes or raises:
 
 ```python
 from contextlib import contextmanager
 
 import logfire
 
-from stepper import Pipeline, StepReport
+from stepper import StepReport
 
 
 class LogfireHooks:
     @contextmanager
-    def step(self, *, stage_name, step_name, input_type, output_type):
+    def step(self, *, path, input_type, output_type):
         report = StepReport()
-        with logfire.span("step {step_name}", step_name=step_name, stage=stage_name,
+        with logfire.span("step {path}", path=path,
                           input_type=input_type, output_type=output_type) as span:
             yield report                          # framework fills report after the step runs
             if report.has_output:
                 span.set_attribute("output", report.output)
 
     @contextmanager
-    def stage(self, *, stage_name, step_count):
-        with logfire.span("stage {stage_name}", stage_name=stage_name, step_count=step_count):
+    def flow(self, *, path, node_count):
+        with logfire.span("flow {path}", path=path, node_count=node_count):
             yield
 
 
-pipeline = Pipeline(..., hooks=LogfireHooks())
+await MyFlow().run(hooks=LogfireHooks())
 ```
 
-**Running several hooks.** Pass a list — `hooks=[LogfireHooks(), StreamHooks(reducer)]`
-(on a `Pipeline` or a `Stage`) — and stepper fans out natively: no composite wrapper.
-Each is entered before the step/stage in list order and exited in reverse, an exception
-propagates into every one at its `yield`, and each gets the step output in its own
-`StepReport`. A lone `hooks=SomeHooks()` behaves exactly as one hook always has.
+A node is identified by its `path`, which is also its persist key, so a span and its
+artifact carry the same name.
+
+**Running several hooks.** Pass a list — `hooks=[LogfireHooks(), StreamHooks(reducer)]` —
+and stepper fans out natively: no composite wrapper. Each is entered before the node in list
+order and exited in reverse, an exception propagates into every one at its `yield`, and each
+gets the step output in its own `StepReport`. A lone `hooks=SomeHooks()` behaves exactly as
+one hook always has.
 
 **Capturing a step's output.** The output only exists *after* the step runs (after your
 `yield`), so you can't yield it. Instead yield a `StepReport`: the framework calls
-`report.set_output(result)` once the step has run and persisted, and your after-`yield`
-code reads `report.output` (guard with `report.has_output` — a step with no return
-annotation persists nothing and leaves the report empty). You never fill it; you never
-implement a method — the framework only ever touches its own `StepReport` type, so
-there's no tracing coupling. Yield nothing if you don't need the output.
+`report.set_output(result)` once the step has run and persisted, and your after-`yield` code
+reads `report.output` (guard with `report.has_output` — a step with no return annotation
+persists nothing and leaves the report empty). You never fill it; you never implement a
+method — the framework only ever touches its own `StepReport` type, so there's no tracing
+coupling. Yield nothing if you don't need the output.
 
 Exactly when each runs:
 
-- **`step(...)`** — code before `yield` runs **before** the step's inputs are fetched
-  and its body runs; code after `yield` runs **after** the body returns *and* its
-  output is persisted. If the step raises, the after-`yield` code is **skipped** and
-  the exception propagates through your context manager — use `try/except` (or
-  `try/finally`) if you need to observe failures.
-- **`stage(...)`** — before-`yield` runs before any step in the stage starts;
-  after-`yield` runs once every step has finished.
-
-The default (`NoOpHooks`) does nothing. Because tracing lives entirely in your hook,
-the framework never sees `logfire` (or a `run_id` contextvar) — bake whatever context
-you want into your hooks instance (e.g. `LogfireHooks(run_id=...)`).
+- **`step(...)`** — code before `yield` runs **before** the step's inputs are fetched and
+  its body runs; code after `yield` runs **after** the body returns *and* its output is
+  persisted. If the step raises, the after-`yield` code is **skipped** and the exception
+  propagates through your context manager — use `try/except` (or `try/finally`) if you need
+  to observe failures.
+- **`flow(...)`** — before-`yield` runs before any node in the flow starts; after-`yield`
+  runs once the flow finishes.
 
 ## Configuration
 
 | Knob | Where | Default | What it does |
 |---|---|---|---|
-| `output_root` | `Pipeline(...)` | `Path("output")` | Root dir for run output; final path is `output_root/name`, plus `/run_id` when `run_id` is given. Relative paths resolve against cwd. |
-| `run_id` | `Pipeline(...)` | `None` | Optional per-run subdir under `output_root/name`, so separate runs don't clobber each other. Omit it and output lands directly in `output_root/name`. Ignored when you pass your own `persist_service`. |
-| `persist_service` | `Pipeline(...)` | disk backend under `output_root` | Swap in any `PersistService` (e.g. in-memory or object store); wins over `output_root`. |
-| `hooks` | `Pipeline(...)` / `Stage(...)` | `NoOpHooks()` | One `Hooks` or a list of them, wrapping each step and stage — add tracing/metrics/actions with no framework tracing dep. Several fan out: entered in order, exited in reverse. |
-| `edges` | `Stage` class body | `()` | Declare the stage's whole control-flow graph, `START` to `EXIT`, and it runs sequentially instead of as a `depends()` DAG. That's how a stage loops. |
-| `max_steps` | `Stage` class body | `1000` | Runaway fuse for an edge-driven stage: raises after this many step executions without reaching `EXIT`. |
-| `fail_fast` | `Pipeline(...)` / `run_steps(...)` | `False` | `True`: a stage cancels its in-flight steps and re-raises on the first step failure. Default: record it, skip its dependents, let independent branches finish. A single-step run always re-raises. |
+| `run_id` | `run(...)` / `mount(...)` | `None` | Prefixes every persist key, so repeat runs don't overwrite each other. Node paths are unaffected, so an address means the same thing in every run. |
+| `persist_service` | `run(...)` / `mount(...)` | `DiskPersistService(base_dir="output")` | The backend, which owns where output physically lands. |
+| `hooks` | `run(...)` / `mount(...)` | `()` | One `Hooks` or a list of them, wrapping every node in the tree. Several fan out: entered in order, exited in reverse. |
+| `edges` | `Flow` class body | — | Required. The flow's whole control-flow graph, `START` to `EXIT`. |
+| `max_steps` | `Flow` class body | `1000` | Runaway fuse: raises after this many node executions without reaching `EXIT`. |
 | `configure_logging(level=, fmt=)` | top-level fn | `INFO`, `"%(message)s"` | Optional stdlib logging setup so `[STEP_*]` / `[MODULE_*]` lines print. |
 
 ## Public API
 
-`Pipeline`, `StageFactory`, `Stage`, `Step`, `step`, `depends`, `optional_depends`,
-`edge`, `Edge`, `START`, `EXIT`, `Scheduler`,
-`PersistService`, `DiskPersistService`, `InMemoryPersistService`, `Persistable`, `Hooks`,
-`NoOpHooks`, `StepReport`, `configure_logging`.
+`Flow`, `FlowRef`, `Node`, `Step`, `step`, `Producer`, `Requirement`, `require`, `depends`,
+`optional_depends`, `edge`, `Edge`, `START`, `EXIT`, `PersistService`, `DiskPersistService`,
+`InMemoryPersistService`, `Persistable`, `Hooks`, `StepReport`, `configure_logging`.
+
+`tests/test_integration.py` is a runnable end-to-end example: one product, two
+marketplaces, one `ChannelFlow` class mounted twice, with a retry loop inside each mount.
 
 ## License
 

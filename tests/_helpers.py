@@ -1,38 +1,51 @@
-"""Reusable models + stages for stepper tests.
+"""Reusable models and flows.
 
-No ``from __future__ import annotations`` — ``Step`` reads raw ``fn.__annotations__``,
-so stringized annotations would break ``.model`` inference and the runners.
+No ``from __future__ import annotations`` — ``Step`` resolves return annotations through
+``get_type_hints``, which works either way, but keeping them real keeps these readable.
 
-Persist keys produced: ``A/prod`` (json), ``B/consume`` (json), ``B/note`` (txt).
-``BStage`` exercises a cross-stage dep (``consume`` <- ``AStage.prod``) and a
-same-stage dep (``note`` <- ``consume``).
+``RootFlow`` mounts ``DoubleFlow`` twice, which is the shape most tests care about: one
+class, two mounts, two key namespaces, bound to different producers.
 """
 
 from pydantic import BaseModel
 
-from stepper.stage import Stage
-from stepper.step import depends, step
+from stepper import EXIT, START, Flow, depends, edge, require, step
 
 
 class Item(BaseModel):
     value: int
 
 
-class AStage(Stage):
+class DoubleFlow(Flow[Item]):
+    """Open: needs an Item, returns twice it."""
+
+    seed = require(Item)
+
     @step
-    async def prod(self) -> Item:
+    async def double(self, item=depends(seed)) -> Item:
+        return Item(value=item.value * 2)
+
+    edges = (edge(START).to(double), edge(double).to(EXIT))
+
+
+class RootFlow(Flow[Item]):
+    """Closed: two mounts of DoubleFlow over the same seed, summed."""
+
+    @step
+    async def start(self) -> Item:
         return Item(value=1)
 
-    steps = (prod,)
-
-
-class BStage(Stage):
-    @step
-    async def consume(self, item=depends(AStage.prod)) -> Item:
-        return Item(value=item.value + 1)
+    left = DoubleFlow.bind(seed=start)
+    right = DoubleFlow.bind(seed=left)
 
     @step
-    async def note(self, item=depends(consume)) -> str:
-        return f"got {item.value}"
+    async def total(self, a=depends(left), b=depends(right)) -> Item:
+        return Item(value=a.value + b.value)
 
-    steps = (consume, note)
+    edges = (
+        edge(START).to(start),
+        edge(start).to(left),
+        edge(left).to(right),
+        edge(right).to(total),
+        edge(total).to(EXIT),
+    )

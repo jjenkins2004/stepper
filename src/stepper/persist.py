@@ -12,10 +12,11 @@ more than the backend's plain encoding subclasses `Persistable` and does its own
 persistence in the hooks, baking any backend naming (a file extension, a bucket path) into
 the keys it passes.
 
-`DiskPersistService` stores each value under `base_dir` (plus a `run_id` subdir when given),
-one file per key: a `str` as `<key>.txt`, raw `bytes` as `<key>` verbatim, everything else
-as `<key>.json` (round-trips int/list/BaseModel). `base_dir` is required — the caller owns
-where output lands.
+`DiskPersistService` stores each value under `base_dir`, one file per key: a `str` as
+`<key>.txt`, raw `bytes` as `<key>` verbatim, everything else as `<key>.json` (round-trips
+int/list/BaseModel). `base_dir` is required — a backend owns where output physically
+lands, which is why it, and not a flow, is what you configure. Per-run separation is the
+flow's `run_id`, which arrives baked into the keys.
 
 `InMemoryPersistService` is the same encoding into a plain dict instead of files — nothing
 touches disk. Use it for a single server-side run whose output must not be written anywhere;
@@ -68,10 +69,6 @@ class Persistable(BaseModel, ABC):
 
 
 class PersistService(ABC):
-    def __init__(self, *, run_id: str | None = None) -> None:
-        # The run this backend persists for; a subclass may key/partition output by it.
-        self.run_id = run_id
-
     def persist(self, key: str, value: T, model: type[T]) -> None:
         """Store one step's output under `key` ("<stage_name>/<step_name>"): write the
         value, then (for a `Persistable`) run its `on_persist` for any side-artifacts."""
@@ -96,11 +93,10 @@ class PersistService(ABC):
 
 
 class DiskPersistService(PersistService):
-    def __init__(self, base_dir: Path, *, run_id: str | None = None) -> None:
-        """`base_dir` is the root dir output lands in; `run_id`, when given, is a
-        per-run subdir under it (so `base_dir/run_id`)."""
-        super().__init__(run_id=run_id)
-        self._base = base_dir / run_id if run_id is not None else base_dir
+    def __init__(self, base_dir: Path | str) -> None:
+        """`base_dir` is the root dir output lands in. Nothing else: a run's separation
+        comes from the `run_id` its root flow bakes into every key."""
+        self._base = Path(base_dir)
 
     def write(self, key: str, value: T, model: type[T]) -> None:
         # str -> .txt, bytes -> the key verbatim, everything else -> .json
@@ -130,11 +126,10 @@ class InMemoryPersistService(PersistService):
     interchangeable — a value is serialized on `write` (`str` verbatim, `bytes` verbatim,
     everything else to JSON) and decoded on `read`. Serializing (not stashing the live
     object) mirrors disk: a read returns an independent copy, so one step can't mutate an
-    earlier step's persisted value. `run_id` is metadata only — the dict is already per-run.
+    earlier step's persisted value.
     """
 
-    def __init__(self, *, run_id: str | None = None) -> None:
-        super().__init__(run_id=run_id)
+    def __init__(self) -> None:
         self._store: dict[str, str | bytes] = {}
 
     def write(self, key: str, value: T, model: type[T]) -> None:

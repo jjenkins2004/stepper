@@ -1,11 +1,12 @@
-"""Lifecycle hooks: wrap each step and each stage run so callers can add telemetry or
-side effects (tracing spans, metrics, actions) without the framework depending on any
-tracing library. Pass a `Hooks` implementation to `Pipeline` (or a `Stage`); the
-default is a no-op.
+"""Lifecycle hooks: wrap every node a run executes so callers can add telemetry or side
+effects (tracing spans, metrics, actions) without the framework depending on any tracing
+library. Pass a `Hooks` implementation to the flow you run and it, and everything mounted
+under it, is wrapped; pass none and nothing is.
 
 Each hook returns a context manager entered around the work: code before `yield` runs
-before the step/stage, code after runs when it finishes or raises — the natural place
-to open and close a span.
+before the node, code after runs when it finishes or raises — the natural place to open
+and close a span. A node is identified by its `path`, which is also the key it persists
+under, so a span and its artifact carry the same name.
 
 A step's output only exists *after* the step runs (after your `yield`), so to capture
 it you yield a `StepReport`: the framework fills it via `set_output` once the step has
@@ -15,8 +16,8 @@ only ever touches its own `StepReport` type — nothing tracing-specific.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterator, Protocol
+from contextlib import AbstractContextManager
+from typing import Any, Protocol
 
 
 class StepReport:
@@ -43,18 +44,17 @@ class StepReport:
 
 
 class Hooks(Protocol):
-    """Wrap step and stage execution. Implement with `@contextmanager` methods (or any
-    object whose `step`/`stage` return a context manager) to emit spans/metrics/actions.
+    """Wrap step and flow execution. Implement with `@contextmanager` methods (or any
+    object whose `step`/`flow` return a context manager) to emit spans/metrics/actions.
     Yield a `StepReport` from `step` to receive the step's output."""
 
     def step(
-        self, *, stage_name: str, step_name: str, input_type: str, output_type: str
+        self, *, path: str, input_type: str, output_type: str
     ) -> AbstractContextManager[StepReport | None]:
         """Wrap one step.
 
         Args:
-            stage_name: Stage the step belongs to (e.g. "Extract").
-            step_name: The step's name.
+            path: The step's path — `"push/tiktok/upload/attempt"`. Also its persist key.
             input_type: Comma-joined names of the models the step reads via `depends()`,
                 or "None" if it takes no inputs.
             output_type: Name of the model the step returns, or "None" if it persists nothing.
@@ -63,19 +63,6 @@ class Hooks(Protocol):
         """
         ...
 
-    def stage(self, *, stage_name: str, step_count: int) -> AbstractContextManager[Any]:
-        """Wrap one stage run. `step_count` is how many steps the stage contains."""
+    def flow(self, *, path: str, node_count: int) -> AbstractContextManager[Any]:
+        """Wrap one flow run. `node_count` is how many nodes the flow contains."""
         ...
-
-
-class NoOpHooks:
-    """Default `Hooks`: every hook is an empty context manager."""
-
-    @contextmanager
-    def step(
-        self, *, stage_name: str, step_name: str, input_type: str, output_type: str
-    ) -> Iterator[StepReport]:
-        yield StepReport()
-
-    def stage(self, *, stage_name: str, step_count: int) -> AbstractContextManager[Any]:
-        return nullcontext()

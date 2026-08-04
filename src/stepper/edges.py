@@ -1,18 +1,13 @@
-"""Control-flow edges: the other way a stage can declare its order.
+"""Control-flow edges: the other way a flow can declare its order.
 
-A stage picks one of two models, and never mixes them:
+Every flow declares its whole graph, and it runs sequentially: one node, then whichever
+edge its result matches, until an edge reaches `EXIT`. Nothing is inferred. Every node the
+flow declares must appear in the graph, `START` says where it begins, and `depends()` is
+pure data wiring with no say in ordering — it is checked against the graph instead.
 
-- **No `edges`** — `depends()` is the order. `Scheduler` derives a DAG from it and runs
-  independent steps concurrently. This is what every stage has always done.
-- **`edges = (...)`** — you declare the whole graph, and it runs sequentially: one step,
-  then whichever edge its result matches, until an edge reaches `EXIT`. Nothing is
-  inferred. Every step in `steps` must appear in the graph, `START` says where it begins,
-  and `depends()` becomes pure data wiring with no say in ordering.
-
-The second model is what a loop needs, because `depends()` is dataflow and can't express
-a cycle or a branch:
-
-    steps = (edit, audit, analysis)
+A *node* is a step or a nested flow, so an edge routes between flows exactly as it routes
+between steps. Declaring the whole thing is what lets a flow loop, which `depends()` never
+could:
 
     edges = (
         edge(START).to(edit),
@@ -24,7 +19,7 @@ a cycle or a branch:
             .otherwise(edit),
     )
 
-Steps stay exactly what they were: inputs via `depends()`, one output model. They know
+Nodes stay exactly what they were: inputs via `depends()`, one output model. They know
 nothing about routing — no marker types, no branch tokens in the return annotation, so
 what lands on disk is still a real domain model. Declaring the edges *below* the steps is
 what makes the back edge legal: `analysis -> edit` is a forward reference at that point in
@@ -35,7 +30,7 @@ value its source produced — `r.passed` above is checked against `AuditResult`,
 The predicate is *called*, never inspected: nothing here reads a return type to decide a
 route. Routing is only ever the edges you declared.
 
-A branch sees its source's output and nothing else, on purpose. The step that just ran is
+A branch sees its source's output and nothing else, on purpose. The node that just ran is
 the thing reporting what happened, so whatever a decision needs belongs in its output
 model — which also makes the persisted artifact a complete account of the state at that
 point. A step needing a fact it doesn't own declares a `depends()` for it like any other
@@ -46,7 +41,7 @@ track several quantities at once — rounds, retries, budget raises — so a sin
 framework-owned counter would be one of them at best, and a second source of truth about
 a loop that already records its own. Counters live in the step's output model, where
 they're typed, persisted, and visible on disk; `r.rounds >= 8` above is a field the step
-wrote. The one number the framework keeps is `Stage.max_steps`, a runaway fuse that is
+wrote. The one number the framework keeps is `Flow.max_steps`, a runaway fuse that is
 never exposed to a predicate.
 
 Predicates take the source's result and must be pure functions of it: they are
@@ -55,6 +50,7 @@ re-evaluated when a crashed run resumes, so no clock, no randomness, no network.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar, overload
 
 if TYPE_CHECKING:
@@ -62,9 +58,15 @@ if TYPE_CHECKING:
 
 R = TypeVar("R")
 
+# One member of a flow: the name it's mounted under, and the declaration object itself
+# (a `Step` handle or an unbound `Flow`). Membership is by *identity* — two flows may each
+# own a step called "validate", and an edge naming the wrong one must be rejected, not
+# quietly rebound to the local one.
+Member = tuple[str, Any]
+
 
 class _Start:
-    """Sentinel edge source: where the graph begins. `edge(START).to(first_step)`."""
+    """Sentinel edge source: where the graph begins. `edge(START).to(first_node)`."""
 
     __slots__ = ()
     name = "START"
@@ -74,7 +76,7 @@ class _Start:
 
 
 class _Exit:
-    """Sentinel edge target: the graph is finished and the stage is done."""
+    """Sentinel edge target: the graph is finished and the flow is done."""
 
     __slots__ = ()
     name = "EXIT"
@@ -90,7 +92,7 @@ EXIT = _Exit()
 class Edge(Generic[R]):
     """One source's outgoing control flow, built by `edge(source)`.
 
-    `R` is the source step's output model, so every predicate's argument is typed:
+    `R` is the source node's output model, so every predicate's argument is typed:
     `edge(audit).when(lambda r: r.passed)` checks `passed` against `AuditResult`.
 
     Either unconditional (`.to(target)`) or a branch chain (`.when(pred).to(target)` one
@@ -101,31 +103,31 @@ class Edge(Generic[R]):
 
     __slots__ = ("source", "_branches", "_default", "_pending", "_unconditional")
 
-    def __init__(self, source: "Step[R] | _Start") -> None:
+    def __init__(self, source: Any) -> None:
         self.source = source
-        self._branches: list[tuple[Callable[[R], bool], "Step[Any] | _Exit"]] = []
-        self._default: "Step[Any] | _Exit | None" = None
+        self._branches: list[tuple[Callable[[R], bool], Any]] = []
+        self._default: Any | None = None
         self._pending: Callable[[R], bool] | None = None
         self._unconditional = False
 
     def when(self, predicate: Callable[[R], bool]) -> "Edge[R]":
         """Take this branch when `predicate(result)` is True — `result` being whatever the
-        source step just returned."""
+        source node just returned."""
         if self._unconditional:
-            raise TypeError(f"edge({self.source.name}): .when(...) after an unconditional .to(...).")
+            raise TypeError(f"edge({_label(self.source)}): .when(...) after an unconditional .to(...).")
         if self._pending is not None:
-            raise TypeError(f"edge({self.source.name}): .when(...) twice with no .to(...) between them.")
+            raise TypeError(f"edge({_label(self.source)}): .when(...) twice with no .to(...) between them.")
         if self._default is not None:
-            raise TypeError(f"edge({self.source.name}): .when(...) after .otherwise(...).")
+            raise TypeError(f"edge({_label(self.source)}): .when(...) after .otherwise(...).")
         self._pending = predicate
         return self
 
-    def to(self, target: "Step[Any] | _Exit") -> "Edge[R]":
+    def to(self, target: Any) -> "Edge[R]":
         """Target of the pending `.when(...)`, or — with no pending predicate — this
         source's single unconditional target."""
         if self._pending is None:
             if self._branches or self._default is not None:
-                raise TypeError(f"edge({self.source.name}): unconditional .to(...) mixed with branches; use .otherwise(...).")
+                raise TypeError(f"edge({_label(self.source)}): unconditional .to(...) mixed with branches; use .otherwise(...).")
             self._unconditional = True
             self._default = target
         else:
@@ -133,14 +135,14 @@ class Edge(Generic[R]):
             self._pending = None
         return self
 
-    def otherwise(self, target: "Step[Any] | _Exit") -> "Edge[R]":
+    def otherwise(self, target: Any) -> "Edge[R]":
         """Fallback when no `.when(...)` matched. Required on any branching edge."""
         if self._unconditional:
-            raise TypeError(f"edge({self.source.name}): .otherwise(...) on an unconditional edge.")
+            raise TypeError(f"edge({_label(self.source)}): .otherwise(...) on an unconditional edge.")
         if not self._branches:
-            raise TypeError(f"edge({self.source.name}): .otherwise(...) with no .when(...) before it.")
+            raise TypeError(f"edge({_label(self.source)}): .otherwise(...) with no .when(...) before it.")
         if self._default is not None:
-            raise TypeError(f"edge({self.source.name}): .otherwise(...) declared twice.")
+            raise TypeError(f"edge({_label(self.source)}): .otherwise(...) declared twice.")
         self._default = target
         return self
 
@@ -148,62 +150,77 @@ class Edge(Generic[R]):
     def is_branching(self) -> bool:
         return bool(self._branches)
 
-    def targets(self) -> list["Step[Any] | _Exit"]:
+    def targets(self) -> list[Any]:
         return [t for _, t in self._branches] + ([self._default] if self._default is not None else [])
 
     def check(self) -> None:
-        """Reject a half-built edge — raised while the stage class is being created."""
+        """Reject a half-built edge — raised while the flow is being declared."""
         if self._pending is not None:
-            raise TypeError(f"edge({self.source.name}): .when(...) with no .to(...) after it.")
+            raise TypeError(f"edge({_label(self.source)}): .when(...) with no .to(...) after it.")
         if self._default is None:
             if not self._branches:
-                raise TypeError(f"edge({self.source.name}): declared with no .to(...) — it routes nowhere.")
+                raise TypeError(f"edge({_label(self.source)}): declared with no .to(...) — it routes nowhere.")
             raise TypeError(
-                f"edge({self.source.name}): branching edge needs .otherwise(...) so every result routes somewhere."
+                f"edge({_label(self.source)}): branching edge needs .otherwise(...) so every result routes somewhere."
             )
 
-    def resolve(self, result: R) -> "Step[Any] | _Exit":
-        """Where control goes after the source step returned `result`: the first branch
+    def resolve(self, result: R) -> Any:
+        """Where control goes after the source node returned `result`: the first branch
         whose predicate matches, else the default."""
         for predicate, target in self._branches:
             if predicate(result):
                 return target
-        assert self._default is not None      # check() ran at class creation
+        assert self._default is not None      # check() ran when the flow was declared
         return self._default
+
+
+def _label(obj: Any) -> str:
+    """Best-effort name for an error message, before membership is resolved."""
+    return getattr(obj, "name", None) or type(obj).__name__
 
 
 @overload
 def edge(source: "Step[R]") -> Edge[R]: ...
 @overload
 def edge(source: _Start) -> Edge[Any]: ...
+@overload
+def edge(source: Any) -> Edge[Any]: ...
 def edge(source: Any) -> Edge[Any]:
-    """Start declaring a source's outgoing control flow — a `Step`, or `START` for the
-    edge into the graph's first step. The returned `Edge` is typed on the step's output,
-    so predicates get a typed `result`. See the module docstring."""
+    """Start declaring a source's outgoing control flow — a `Step`, a nested `Flow`, or
+    `START` for the edge into the graph's first node. The returned `Edge` is typed on a
+    step's output, so predicates get a typed `result`. See the module docstring."""
     return Edge(source)
 
 
 class Graph:
-    """A stage's validated control-flow graph: where it starts and the edge out of every
-    step. Built once per stage class, so a malformed graph raises at class creation —
-    same contract as the dependency DAG it replaces.
+    """A flow's validated control-flow graph: where it starts and the edge out of every
+    node. Built once when the flow is declared, so a malformed graph raises then — same
+    contract as the dependency DAG it replaces.
 
-    "Declare the whole graph" is enforced here: every step the stage lists must have an
+    "Declare the whole graph" is enforced here: every node the flow lists must have an
     edge out and be reachable from `START`, and `EXIT` must be reachable. Nothing is
-    inferred and nothing is optional. On top of that, every step's required `depends()`
+    inferred and nothing is optional. On top of that, every node's required `depends()`
     must be *guaranteed* to have run before it — see `_check_deps_available`.
+
+    Nodes are identified by their member name; `required`/`optional` are the flow's
+    already-resolved dependency maps (`{node: {node it needs}}` and `[(consumer,
+    producer)]`), so nothing here has to know what a step or a flow is.
     """
 
-    def __init__(self, edges: tuple[Edge[Any], ...], steps: tuple["Step[Any]", ...], label: str) -> None:
-        self.label = label
+    def __init__(
+        self,
+        edges: tuple[Edge[Any], ...],
+        members: Sequence[Member],
+        label: str,
+        required: Mapping[str, set[str]],
+        optional: Iterable[tuple[str, str]],
+    ) -> None:
+        self._members = list(members)                     # keep alive: ids are the identity
+        self._name_by_id = {id(obj): name for name, obj in self._members}
         self._by_source: dict[str, Edge[Any]] = {}
         where = f"{label} " if label else ""
-        # Membership is by *identity*, not name: two stages may each own a step called
-        # "validate", and an edge naming the wrong stage's must be rejected, not quietly
-        # rebound to the local one.
-        member_steps = set(steps)
-        members = {s.name for s in steps}
-        entry: Any = None
+        names = {name for name, _ in self._members}
+        entry: str | None = None
 
         for e in edges:
             e.check()
@@ -212,80 +229,91 @@ class Graph:
                     raise TypeError(f"{where}edges: more than one edge(START); the graph has one way in.")
                 if e.is_branching:
                     raise TypeError(f"{where}edges: edge(START) must be unconditional — there is no result to branch on.")
-                entry = e.targets()[0]
-                if isinstance(entry, _Exit):
+                target = e.targets()[0]
+                if isinstance(target, _Exit):
                     raise TypeError(f"{where}edges: edge(START).to(EXIT) runs nothing.")
+                entry = self._name_of(target)
+                if entry is None:
+                    raise TypeError(f"{where}edges: edge(START) routes to {_label(target)!r}, which is not a node of this flow.")
                 continue
-            if e.source not in member_steps:
-                raise TypeError(f"{where}edges: {e.source.name!r} is not in steps = (...).")
-            if e.source.name in self._by_source:
-                raise TypeError(f"{where}edges: {e.source.name!r} has more than one edge(...); one per step.")
-            self._by_source[e.source.name] = e
+            source = self._name_of(e.source)
+            if source is None:
+                raise TypeError(f"{where}edges: {_label(e.source)!r} is not a node of this flow.")
+            if source in self._by_source:
+                raise TypeError(f"{where}edges: {source!r} has more than one edge(...); one per node.")
+            self._by_source[source] = e
 
         if entry is None:
             raise TypeError(f"{where}edges: no edge(START).to(...), so nothing says where the graph begins.")
-        if entry not in member_steps:
-            raise TypeError(f"{where}edges: edge(START) routes to {entry.name!r}, which is not in steps = (...).")
-        self.entry: "Step[Any]" = entry
+        self.entry: str = entry
 
-        for e in edges:
-            for t in e.targets():
-                if not isinstance(t, _Exit) and t not in member_steps:
-                    raise TypeError(f"{where}edges: {e.source.name!r} routes to {t.name!r}, which is not in steps = (...).")
-
-        missing = sorted(members - set(self._by_source))
-        if missing:
-            raise TypeError(
-                f"{where}edges: {', '.join(missing)} declare no edge(...) out. A stage with edges "
-                f"declares its whole graph — every step needs one."
-            )
-
-        self._check_reachability(where, members)
-        self._check_deps_available(where, steps)
-
-    def _predecessors(self, names: list[str]) -> dict[str, set[str]]:
-        preds: dict[str, set[str]] = {n: set() for n in names}
         for source, e in self._by_source.items():
             for t in e.targets():
-                if not isinstance(t, _Exit):
-                    preds[t.name].add(source)
+                if not isinstance(t, _Exit) and self._name_of(t) is None:
+                    raise TypeError(f"{where}edges: {source!r} routes to {_label(t)!r}, which is not a node of this flow.")
+
+        missing = sorted(names - set(self._by_source))
+        if missing:
+            raise TypeError(
+                f"{where}edges: {', '.join(missing)} declare no edge(...) out. A flow with edges "
+                f"declares its whole graph — every node needs one."
+            )
+
+        self._check_reachability(where, names)
+        self._check_deps_available(where, names, required, optional)
+
+    def _name_of(self, obj: Any) -> str | None:
+        return self._name_by_id.get(id(obj))
+
+    def _targets_of(self, name: str) -> list[str]:
+        """Names of the nodes `name` can route to (EXIT dropped)."""
+        return [
+            n for n in (self._name_of(t) for t in self._by_source[name].targets() if not isinstance(t, _Exit))
+            if n is not None
+        ]
+
+    def _predecessors(self, names: Iterable[str]) -> dict[str, set[str]]:
+        preds: dict[str, set[str]] = {n: set() for n in names}
+        for source in self._by_source:
+            for t in self._targets_of(source):
+                preds[t].add(source)
         return preds
 
-    def _check_reachability(self, where: str, members: set[str]) -> None:
-        """Every step must be reachable from the entry, and every step must be able to
+    def _check_reachability(self, where: str, names: set[str]) -> None:
+        """Every node must be reachable from the entry, and every node must be able to
         reach `EXIT` — otherwise the graph either contains dead code or contains a branch
         that, once taken, can never finish.
 
-        The second half is per-step, not "somewhere in the graph there's an EXIT". A
+        The second half is per-node, not "somewhere in the graph there's an EXIT". A
         branch whose arm drops into a sub-cycle with no way out is exactly as broken as a
         graph with no EXIT at all; it just takes a run to find out.
         """
         seen: set[str] = set()
-        frontier = [self.entry.name]
+        frontier = [self.entry]
         while frontier:
             name = frontier.pop()
             if name in seen:
                 continue
             seen.add(name)
-            frontier.extend(t.name for t in self._by_source[name].targets() if not isinstance(t, _Exit))
+            frontier.extend(self._targets_of(name))
 
-        unreachable = sorted(members - seen)
+        unreachable = sorted(names - seen)
         if unreachable:
             raise TypeError(f"{where}edges: {', '.join(unreachable)} is unreachable from START.")
 
-        # Walk backwards from the steps that route to EXIT directly.
+        # Walk backwards from the nodes that route to EXIT directly.
         can_exit = {
-            n for n in members if any(isinstance(t, _Exit) for t in self._by_source[n].targets())
+            n for n in names if any(isinstance(t, _Exit) for t in self._by_source[n].targets())
         }
         changed = True
         while changed:
             changed = False
-            for name in members - can_exit:
-                if any(t.name in can_exit for t in self._by_source[name].targets() if not isinstance(t, _Exit)):
+            for name in names - can_exit:
+                if any(t in can_exit for t in self._targets_of(name)):
                     can_exit.add(name)
                     changed = True
 
-        stuck = sorted(members - can_exit)
+        stuck = sorted(names - can_exit)
         if stuck:
             raise TypeError(
                 f"{where}edges: {', '.join(stuck)} has no route to EXIT — once control reaches "
@@ -296,7 +324,7 @@ class Graph:
         """Whether control can get from `source` to `target` by following edges — i.e.
         whether *some* execution runs `source` before `target`."""
         seen: set[str] = set()
-        frontier = [t.name for t in self._by_source[source].targets() if not isinstance(t, _Exit)]
+        frontier = self._targets_of(source)
         while frontier:
             name = frontier.pop()
             if name == target:
@@ -304,12 +332,18 @@ class Graph:
             if name in seen:
                 continue
             seen.add(name)
-            frontier.extend(t.name for t in self._by_source[name].targets() if not isinstance(t, _Exit))
+            frontier.extend(self._targets_of(name))
         return False
 
-    def _check_deps_available(self, where: str, steps: tuple["Step[Any]", ...]) -> None:
-        """A step's same-stage `depends()` has to line up with the graph, and the bar
-        differs by kind:
+    def _check_deps_available(
+        self,
+        where: str,
+        names: set[str],
+        required: Mapping[str, set[str]],
+        optional: Iterable[tuple[str, str]],
+    ) -> None:
+        """A node's in-flow `depends()` has to line up with the graph, and the bar differs
+        by kind:
 
         - **required** — the producer must have run on *every* path from START. A step
           fetches its inputs off the backend, so a producer that hasn't run has nothing
@@ -320,51 +354,33 @@ class Graph:
           parameter can be None forever; if no route from producer to consumer exists, the
           wiring is dead and the graph doesn't mean what it looks like it means.
 
-        The required side is a "must have executed" fixpoint: what's guaranteed at a step
+        The required side is a "must have executed" fixpoint: what's guaranteed at a node
         is the intersection over its predecessors of (guaranteed at that predecessor, plus
         the predecessor itself). The entry gets the empty set — START guarantees nothing —
         which is what makes a first-pass back-edge read come out unavailable, and why it
         has to be optional. The optional side is plain reachability, which is why a back
         edge passes: in `START -> b`, `b -> a`, `a -> b`, the second visit to `b` does have
-        `a` behind it. Cross-stage deps are excluded from both: those are disk inputs from
-        an earlier stage, not this graph's business.
+        `a` behind it. Deps resolved outside this flow are excluded from both: those are
+        persisted inputs from elsewhere in the tree, not this graph's business.
         """
-        names = [s.name for s in steps]
-        member_steps = set(steps)
-        required: dict[str, set[str]] = {}
-        optional: list[tuple[str, str]] = []
-        for s in steps:
-            opt_params = s.optional_dependencies()
-            deps = s.dependencies()
-            # A producer that persists nothing is never fetched, so neither rule applies:
-            # the dep is pure ordering, and in an edge-driven stage the edges already own
-            # that. Nothing about the graph can make it fail.
-            required[s.name] = {
-                dep.name for param, dep in deps.items()
-                if param not in opt_params and dep in member_steps and dep.model is not None
-            }
-            optional.extend(
-                (s.name, dep.name) for param, dep in deps.items()
-                if param in opt_params and dep in member_steps and dep.model is not None
-            )
-
-        preds = self._predecessors(names)
-        available: dict[str, set[str]] = {n: set(names) for n in names}
-        available[self.entry.name] = set()
+        ordered = sorted(names)
+        preds = self._predecessors(ordered)
+        available: dict[str, set[str]] = {n: set(ordered) for n in ordered}
+        available[self.entry] = set()
 
         changed = True
         while changed:
             changed = False
-            for name in names:
-                if name == self.entry.name:
+            for name in ordered:
+                if name == self.entry:
                     continue          # START contributes nothing, so the entry stays empty
                 fresh = set.intersection(*(available[p] | {p} for p in preds[name]))
                 if fresh != available[name]:
                     available[name] = fresh
                     changed = True
 
-        for name in names:
-            unmet = sorted(required[name] - available[name])
+        for name in ordered:
+            unmet = sorted(required.get(name, set()) - available[name])
             if unmet:
                 raise TypeError(
                     f"{where}edges: {name!r} requires {', '.join(repr(u) for u in unmet)}, which "
@@ -381,11 +397,19 @@ class Graph:
                     f"every pass. Drop the dependency, or route so {producer!r} can precede it."
                 )
 
+    def terminals(self) -> list[str]:
+        """Nodes with an edge to `EXIT` — the ones a run can end on, and so the ones whose
+        value can be this flow's. Every one of them has to produce the same model."""
+        return [
+            name for name, e in self._by_source.items()
+            if any(isinstance(t, _Exit) for t in e.targets())
+        ]
+
     def edge_for(self, name: str) -> Edge[Any]:
         return self._by_source[name]
 
+    def target_name(self, obj: Any) -> str | None:
+        """Member name of an edge target, or None for `EXIT`."""
+        return None if isinstance(obj, _Exit) else self._name_of(obj)
 
-def build_graph(edges: tuple[Edge[Any], ...], steps: tuple["Step[Any]", ...], label: str) -> Graph | None:
-    """The stage's control-flow graph, or None when it declares no `edges` and therefore
-    runs as a `depends()`-ordered DAG."""
-    return Graph(edges, steps, label) if edges else None
+

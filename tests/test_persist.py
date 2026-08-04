@@ -1,131 +1,147 @@
-"""Persistence: str/bytes/JSON values + the Persistable side-artifact hooks.
-
-No ``from __future__ import annotations`` — ``Step`` reads raw ``fn.__annotations__``,
-so stringized return annotations would break ``.model`` inference for the stages below.
-
-Uses the disk-backed ``persist`` fixture (see conftest); ``tmp_path`` is the same dir it
-roots under, so tests can assert the on-disk path directly.
-"""
+"""The persistence layer. The only contract a backend owes is that `write` then `read`
+round-trips; everything above it treats keys as opaque strings."""
 
 import pytest
-from pydantic import PrivateAttr
+from pydantic import BaseModel, PrivateAttr
 
 from stepper import (
+    EXIT,
+    START,
     DiskPersistService,
+    Flow,
+    InMemoryPersistService,
     Persistable,
     PersistService,
-    Pipeline,
-    Stage,
     depends,
+    edge,
     step,
 )
 
 
-class Doc(Persistable):
-    """Toy Persistable: JSON metadata (``name`` + the blob ``ids``) plus a PrivateAttr
-    blob map persisted as ``bytes`` under sub-keys and lazy-read after fetch via ``load``."""
+class Doc(BaseModel):
+    title: str
+    pages: int
 
-    name: str
-    ids: list[str]
-    _blobs: dict[str, bytes] = PrivateAttr(default_factory=dict)
-    _service: "PersistService | None" = PrivateAttr(default=None)
+
+class Blob(Persistable):
+    """A model with a side-artifact the plain encoding wouldn't cover."""
+
+    caption: str
+    _data: bytes = PrivateAttr(default=b"")
+    _service: PersistService | None = PrivateAttr(default=None)
     _key: str = PrivateAttr(default="")
 
-    def on_persist(self, service, key):
-        for id in self.ids:
-            service.persist(f"{key}/{id}.bin", self._blobs[id], bytes)  # extension baked into key
+    def on_persist(self, service: PersistService, key: str) -> None:
+        service.persist(f"{key}/blob.bin", self._data, bytes)
 
-    def on_fetch(self, service, key):
-        self._service = service
-        self._key = key
+    def on_fetch(self, service: PersistService, key: str) -> None:
+        self._service, self._key = service, key
 
-    def load(self, id):  # lazy: reads the blob off the service on demand
+    def load(self) -> bytes:
         assert self._service is not None
-        return self._service.fetch(f"{self._key}/{id}.bin", bytes)
+        return self._service.fetch(f"{self._key}/blob.bin", bytes)
 
 
-# --- raw bytes under an opaque key -------------------------------------------------
+@pytest.fixture(params=["disk", "memory"])
+def backend(request, tmp_path):
+    return DiskPersistService(base_dir=tmp_path) if request.param == "disk" else InMemoryPersistService()
 
 
-def test_bytes_persist_under_opaque_key(persist, tmp_path):
-    # bytes land under the key verbatim — any extension is just part of the key
-    persist.persist("Render/thumb.png", b"\x00\x01\x02", bytes)
-
-    assert (tmp_path / "Render" / "thumb.png").exists()
-    assert persist.fetch("Render/thumb.png", bytes) == b"\x00\x01\x02"
+# --- round trips ----------------------------------------------------------------------
 
 
-def test_fetch_missing_bytes_raises(persist):
-    with pytest.raises(FileNotFoundError, match="Render/thumb"):
-        persist.fetch("Render/thumb.png", bytes)
+@pytest.mark.parametrize(
+    "value,model",
+    [
+        (Doc(title="t", pages=3), Doc),
+        ("plain text", str),
+        (b"\x00\x01binary", bytes),
+        (7, int),
+        ([1, 2, 3], list[int]),
+    ],
+)
+def test_values_round_trip(backend, value, model):
+    backend.persist("k", value, model)
+    assert backend.fetch("k", model) == value
 
 
-# --- Persistable metadata + blobs --------------------------------------------------
+def test_a_read_returns_an_independent_copy(backend):
+    doc = Doc(title="t", pages=1)
+    backend.persist("k", doc, Doc)
+    fetched = backend.fetch("k", Doc)
+    fetched.pages = 99
+    assert backend.fetch("k", Doc).pages == 1
 
 
-def test_persistable_round_trips_metadata_and_blobs(persist, tmp_path):
-    doc = Doc(name="report", ids=["a", "b"])
-    doc._blobs = {"a": b"alpha", "b": b"beta"}
-    persist.persist("Build/doc", doc, Doc)
-
-    # metadata JSON and the blob dir coexist under the same key
-    assert (tmp_path / "Build" / "doc.json").exists()
-    assert (tmp_path / "Build" / "doc" / "a.bin").exists()
-    assert (tmp_path / "Build" / "doc" / "b.bin").exists()
-
-    back = persist.fetch("Build/doc", Doc)
-    assert back.name == "report"
-    assert back.ids == ["a", "b"]
-    assert not back._blobs  # blobs aren't in the JSON; loaded lazily
-    assert back.load("a") == b"alpha"
-    assert back.load("b") == b"beta"
+def test_a_missing_key_raises_file_not_found(backend):
+    """Both backends agree, which is what lets an optional dep read back as None."""
+    with pytest.raises(FileNotFoundError):
+        backend.fetch("absent", Doc)
 
 
-# --- through a two-stage Pipeline with run_id --------------------------------------
+def test_a_key_with_slashes_nests(backend):
+    backend.persist("a/b/c", Doc(title="t", pages=1), Doc)
+    assert backend.fetch("a/b/c", Doc).title == "t"
 
 
-class ProduceStage(Stage):
-    @step
-    async def doc(self) -> Doc:
-        d = Doc(name="report", ids=["a"])
-        d._blobs = {"a": b"payload"}
-        return d
-
-    steps = (doc,)
+# --- the disk encoding ----------------------------------------------------------------
 
 
-class ConsumeStage(Stage):
-    @step
-    async def read(self, doc=depends(ProduceStage.doc)) -> str:
-        return f"{doc.name}:{doc.load('a').decode()}"
-
-    steps = (read,)
-
-
-def test_persistable_flows_through_pipeline(tmp_path, run):
-    p = Pipeline(
-        name="p",
-        run_id="r1",
-        output_root=tmp_path,
-        stages={
-            "produce": lambda ps: ProduceStage(persist_service=ps),
-            "consume": lambda ps: ConsumeStage(persist_service=ps),
-        },
-    )
-    run(p.run(stage="all"))
-
-    base = tmp_path / "p" / "r1"  # output_root/name/run_id
-    assert (base / "Produce" / "doc.json").exists()
-    assert (base / "Produce" / "doc" / "a.bin").exists()
-    # consumer depends() on the Persistable, fetched back and its blob lazy-loaded
-    assert p.persist_service.fetch("Consume/read", str) == "report:payload"
+def test_disk_picks_an_extension_from_the_model(tmp_path, persist):
+    persist.persist("s", "text", str)
+    persist.persist("d", Doc(title="t", pages=1), Doc)
+    persist.persist("b", b"raw", bytes)
+    assert (tmp_path / "s.txt").read_text() == "text"
+    assert (tmp_path / "d.json").exists()
+    assert (tmp_path / "b").read_bytes() == b"raw"
 
 
-def test_run_id_scopes_persistable_output(tmp_path):
-    svc = DiskPersistService(base_dir=tmp_path, run_id="r9")
-    doc = Doc(name="x", ids=["a"])
-    doc._blobs = {"a": b"z"}
-    svc.persist("Build/doc", doc, Doc)
+# --- Persistable ----------------------------------------------------------------------
 
-    assert (tmp_path / "r9" / "Build" / "doc.json").exists()
-    assert (tmp_path / "r9" / "Build" / "doc" / "a.bin").exists()
+
+def test_a_persistable_stores_its_side_artifact(backend):
+    blob = Blob(caption="hi")
+    blob._data = b"\xff\xfe"
+    backend.persist("k", blob, Blob)
+    back = backend.fetch("k", Blob)
+    assert back.caption == "hi"
+    assert back.load() == b"\xff\xfe"
+
+
+def test_a_persistable_flows_through_a_run(run, mem):
+    class Blobby(Flow[Blob]):
+        @step
+        async def make(self) -> Blob:
+            b = Blob(caption="one")
+            b._data = b"payload"
+            return b
+
+        @step
+        async def read(self, b=depends(make)) -> Blob:
+            out = Blob(caption=f"{b.caption}/{b.load().decode()}")
+            out._data = b""
+            return out
+
+        edges = (edge(START).to(make), edge(make).to(read), edge(read).to(EXIT))
+
+    assert run(Blobby().run(persist_service=mem)).caption == "one/payload"
+
+
+# --- the backend owns where things land ------------------------------------------------
+
+
+def test_the_backend_decides_the_location_not_the_flow(run, tmp_path):
+    from _helpers import RootFlow
+
+    nested = tmp_path / "deep" / "er"
+    run(RootFlow().run(persist_service=DiskPersistService(base_dir=nested)))
+    assert (nested / "root" / "start.json").exists()
+
+
+def test_two_runs_of_one_flow_stay_apart_by_run_id(run, mem):
+    from _helpers import Item, RootFlow
+
+    run(RootFlow().run(run_id="a", persist_service=mem))
+    run(RootFlow().run(run_id="b", persist_service=mem))
+    assert mem.fetch("a/root/start", Item) == mem.fetch("b/root/start", Item)
+    assert {k.split("/", 1)[0] for k in mem._store} == {"a", "b"}

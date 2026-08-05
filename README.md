@@ -337,6 +337,15 @@ declared elsewhere, a binding whose model doesn't match the `require()`, an unbo
 requirement, a name bound to two producers, and terminals that disagree about what the flow
 produces.
 
+One more, from the persistence side: a step whose return model is a plain `BaseModel`
+holding a `Persistable` — at any depth, including through a union or a container. The hooks
+run only for the model `persist` is *given*, so a buried one would have its fields dumped as
+JSON and its side-artifacts dropped: the metadata reads back intact and the blobs are simply
+gone. Return the `Persistable` itself, or make the outer model a `Persistable` whose
+`on_persist`/`on_fetch` forward to it. Checking a step's return type covers every model that
+crosses the persist layer, since a flow's output must equal a terminal's and a `require()`
+must match the producer bound to it.
+
 ### Passes and resume
 
 A node overwrites its key on every pass, so `depends()` always reads the latest — right

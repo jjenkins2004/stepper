@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, TypeVar, 
 from pydantic import TypeAdapter, ValidationError
 
 from stepper.node import Context, Node
+from stepper.persist import nested_persistable_path
 from stepper.producer import Producer
 from stepper.step_logging import format_step_end, format_step_fail, format_step_start
 
@@ -50,6 +51,20 @@ class Step(Node, Producer[R]):
         # preserve the "no model => don't persist" contract the runner relies on.
         ret = get_type_hints(fn).get("return")
         self._model: Any = None if ret is type(None) else ret
+        # A Persistable only gets its hooks run when it IS the declared model, so one
+        # buried in a plain model would lose its side-artifacts with nothing raised.
+        # Every model that crosses persist starts as some step's return annotation —
+        # a flow's output must equal a terminal's, and a require() must match the
+        # producer bound to it — so checking here covers all three.
+        buried = nested_persistable_path(self._model)
+        if buried is not None:
+            raise TypeError(
+                f"step {self.name!r} returns {getattr(self._model, '__name__', self._model)}, "
+                f"which holds a Persistable at {buried}. Only the declared model's hooks "
+                f"run, so that one's side-artifacts would be dropped without an error. "
+                f"Return the Persistable itself, or make the outer model a Persistable "
+                f"that forwards on_persist/on_fetch to it."
+            )
         self._adapter: TypeAdapter[Any] | None = None
         self.owner: "type[Flow] | None" = None
 

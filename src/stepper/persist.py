@@ -12,6 +12,11 @@ more than the backend's plain encoding subclasses `Persistable` and does its own
 persistence in the hooks, baking any backend naming (a file extension, a bucket path) into
 the keys it passes.
 
+The hooks run for the model `persist`/`fetch` are *given*, not for models reached through
+its fields, so a `Persistable` buried in a plain `BaseModel` would silently lose its
+side-artifacts. `nested_persistable_path` finds that, and `Step` rejects it where the return
+type is declared.
+
 `DiskPersistService` stores each value under `base_dir`, one file per key: a `str` as
 `<key>.txt`, raw `bytes` as `<key>` verbatim, everything else as `<key>.json` (round-trips
 int/list/BaseModel). `base_dir` is required — a backend owns where output physically
@@ -27,7 +32,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast, get_args, get_origin
 
 from pydantic import BaseModel, TypeAdapter
 
@@ -36,6 +41,61 @@ T = TypeVar("T")
 
 def _is_persistable(model: object) -> bool:
     return isinstance(model, type) and issubclass(model, Persistable)
+
+
+def _is_plain_model(model: object) -> bool:
+    return (
+        isinstance(model, type)
+        and issubclass(model, BaseModel)
+        and not issubclass(model, Persistable)
+    )
+
+
+def nested_persistable_path(model: object) -> str | None:
+    """The path to a `Persistable` buried inside a plain model, or `None` if there is none.
+
+    `persist`/`fetch` decide whether to run the hooks with one check on the *declared*
+    model — they don't walk fields. So a `Persistable` used as a field of a plain
+    `BaseModel` has its fields dumped to JSON and its side-artifacts silently dropped:
+    the metadata reads back intact and the blobs are simply gone. Catching that where the
+    type is declared is the difference between an error and missing bytes.
+
+    Descends through plain models, unions and containers. Stops at a `Persistable` — one
+    nested inside another is that model's own business, since its `on_persist` decides
+    what to forward.
+    """
+    return _search(model, frozenset())
+
+
+def _search(model: object, seen: frozenset[Any]) -> str | None:
+    if get_origin(model) is not None:
+        # A union or container (`list[X]`, `dict[str, X]`, `X | None`) — a Persistable is
+        # just as buried inside one, so look at what it holds.
+        for arg in get_args(model):
+            if arg is type(None):
+                continue
+            if _is_persistable(arg):
+                return getattr(arg, "__name__", str(arg))
+            found = _search(arg, seen)
+            if found is not None:
+                return found
+        return None
+
+    if not _is_plain_model(model) or model in seen:
+        return None
+
+    owner = cast(type, model).__name__
+    seen = seen | {model}
+    for name, field in cast(type[BaseModel], model).model_fields.items():
+        annotation = field.annotation
+        if _is_persistable(annotation):
+            return f"{owner}.{name}"
+        found = _search(annotation, seen)
+        if found is not None:
+            # A container hit reports just the type; a nested model hit reports a path.
+            joiner = " -> " if "." in found else ": "
+            return f"{owner}.{name}{joiner}{found}"
+    return None
 
 
 class Persistable(BaseModel, ABC):

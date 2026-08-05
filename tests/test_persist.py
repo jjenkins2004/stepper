@@ -145,3 +145,126 @@ def test_two_runs_of_one_flow_stay_apart_by_run_id(run, mem):
     run(RootFlow().run(run_id="b", persist_service=mem))
     assert mem.fetch("a/root/start", Item) == mem.fetch("b/root/start", Item)
     assert {k.split("/", 1)[0] for k in mem._store} == {"a", "b"}
+
+
+# --- a Persistable buried in a plain model is rejected ---------------------------------
+#
+# The hooks only run for the *declared* model, so a Persistable used as a field of a plain
+# BaseModel would have its side-artifacts dropped with nothing raised. That is caught where
+# the step declares its return type.
+
+
+class Bundle(BaseModel):
+    """The mistake: a plain model carrying a Persistable."""
+
+    note: str
+    blob: Blob
+
+
+class Outer(BaseModel):
+    inner: Bundle
+
+
+class SelfRef(BaseModel):
+    """Guards the field walk against recursing forever."""
+
+    name: str
+    child: "SelfRef | None" = None
+
+
+class Carrier(Persistable):
+    """The supported way to nest: the outer model is itself a Persistable, so its own
+    hooks decide what to forward."""
+
+    blob: Blob
+
+    def on_persist(self, service: PersistService, key: str) -> None:
+        self.blob.on_persist(service, f"{key}/blob")
+
+    def on_fetch(self, service: PersistService, key: str) -> None:
+        self.blob.on_fetch(service, f"{key}/blob")
+
+
+@pytest.mark.parametrize(
+    "annotation,expected",
+    [
+        (Bundle, "Bundle.blob"),
+        (Bundle | None, "Bundle.blob"),
+        (list[Bundle], "Bundle.blob"),
+        (dict[str, Bundle], "Bundle.blob"),
+        (Outer, "Outer.inner -> Bundle.blob"),
+    ],
+)
+def test_a_persistable_inside_a_plain_model_is_rejected(annotation, expected):
+    with pytest.raises(TypeError) as exc:
+
+        @step
+        async def make(self) -> annotation: ...
+
+    assert expected in str(exc.value)
+    assert "Persistable" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        list[Blob],
+        dict[str, Blob],
+        Blob | None,
+    ],
+)
+def test_a_persistable_inside_a_container_is_rejected(annotation):
+    with pytest.raises(TypeError, match="Blob"):
+
+        @step
+        async def make(self) -> annotation: ...
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        Blob,          # the declared model itself — hooks run
+        Carrier,       # a Persistable holding one, forwarding by hand
+        Doc,           # a plain model with nothing buried
+        str,
+        bytes,
+        int,
+        list[str],
+        dict[str, int],
+        SelfRef,       # recursive plain model, no Persistable anywhere
+        None,
+    ],
+)
+def test_models_without_a_buried_persistable_are_accepted(annotation):
+    @step
+    async def make(self) -> annotation: ...
+
+    assert make.name == "make"
+
+
+def test_the_error_names_the_field_and_the_fix():
+    with pytest.raises(TypeError) as exc:
+
+        @step
+        async def build_bundle(self) -> Bundle: ...
+
+    message = str(exc.value)
+    assert "build_bundle" in message
+    assert "Bundle.blob" in message
+    assert "on_persist" in message
+
+
+def test_a_carrier_persistable_still_round_trips_its_nested_blob(run, mem):
+    """The supported nesting keeps working end to end."""
+
+    class Nested(Flow[Carrier]):
+        @step
+        async def make(self) -> Carrier:
+            inner = Blob(caption="c")
+            inner._data = b"deep"
+            return Carrier(blob=inner)
+
+        edges = (edge(START).to(make), edge(make).to(EXIT))
+
+    run(Nested().run(persist_service=mem))
+    assert mem.fetch("nested/make", Carrier).blob.load() == b"deep"
